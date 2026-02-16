@@ -1,0 +1,5 @@
+/profile_data
+/__pycache__
+/saved_pages
+/scan_results
+*.json
