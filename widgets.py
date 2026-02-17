@@ -1,10 +1,12 @@
 """Reusable UI widgets."""
 
 from collections.abc import Callable
+from PyQt6.QtCore import QUrl
 from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
-    QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy, QTextEdit, QVBoxLayout, QWidget
+    QFormLayout, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy,
+    QSplitter, QTextEdit, QVBoxLayout, QWidget
 )
 
 from config import DEFAULT_FOLLOWING_SCAN_URL, POPUP_URL
@@ -79,7 +81,7 @@ class WebEngineView(QWebEngineView):
 
 
 class ScanTab(QWidget):
-    def __init__(self, web_view: QWebEngineView) -> None:
+    def __init__(self, web_view: QWebEngineView, worker_views: list[QWebEngineView]) -> None:
         super().__init__()
         layout = QVBoxLayout()
         self.setLayout(layout)
@@ -94,7 +96,35 @@ class ScanTab(QWidget):
         self.log_output.setFixedHeight(180)
         layout.addWidget(self.log_output)
         self.web_view = web_view
-        layout.addWidget(self.web_view)
+        self.worker_views = worker_views
+
+        splitter = QSplitter()
+        left_container = QWidget()
+        left_layout = QVBoxLayout()
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.addWidget(self.web_view)
+        left_container.setLayout(left_layout)
+
+        right_container = QWidget()
+        right_layout = QVBoxLayout()
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        workers_grid = QGridLayout()
+        workers_grid.setContentsMargins(0, 0, 0, 0)
+        for idx, view in enumerate(self.worker_views):
+            row = idx // 2
+            col = idx % 2
+            workers_grid.addWidget(view, row, col)
+        right_layout.addLayout(workers_grid)
+        right_container.setLayout(right_layout)
+
+        splitter.addWidget(left_container)
+        splitter.addWidget(right_container)
+        splitter.setSizes([700, 500])
+        layout.addWidget(splitter)
 
     def set_running(self, running: bool) -> None:
         self.state_label.setText("Escaneando..." if running else "Listo")
+
+    def clear_workers(self) -> None:
+        for view in self.worker_views:
+            view.setUrl(QUrl("about:blank"))

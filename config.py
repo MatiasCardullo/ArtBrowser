@@ -8,7 +8,7 @@ from typing import Iterable, Protocol
 from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEngineSettings
 from PyQt6.QtWidgets import QApplication
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = Path(__file__).resolve().parent
 SESSION_FILE = BASE_DIR / "session.json"
 SETTINGS_FILE = BASE_DIR / "settings.json"
 PROFILE_DIR = BASE_DIR / "profile_data"

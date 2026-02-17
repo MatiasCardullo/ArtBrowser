@@ -1,10 +1,7 @@
 """Main window implementation."""
 
-import multiprocessing as mp
 import re
-from collections import deque
 from datetime import datetime
-from queue import Empty
 
 from PyQt6.QtCore import QTimer, QUrl
 from PyQt6.QtGui import QAction
@@ -14,10 +11,14 @@ from PyQt6.QtWidgets import (
 )
 
 from config import (
-    BASE_DIR, DEFAULT_URL, SCAN_DB_FILE, SCAN_MAX_PARALLEL_REQUESTS,
+    BASE_DIR, DEFAULT_URL, SCAN_DB_FILE,
     save_session, save_settings
 )
-from scanner import run_scan_process
+from scanner import (
+    build_profile_row_from_html,
+    extract_profile_candidates,
+    save_scan_results,
+)
 from widgets import ScanTab, SettingsTab, WebEngineView
 
 
@@ -30,17 +31,14 @@ class BrowserWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("ArtBrowser")
         self.resize(1200, 800)
-        self.scan_process: mp.Process | None = None
-        self.scan_queue: mp.Queue | None = None
         self.scan_tab: ScanTab | None = None
         self.scan_settings_tab: SettingsTab | None = None
-        self.scan_log_buffer: deque[str] = deque()
-        self.scan_log_timer = QTimer(self)
-        self.scan_log_timer.setInterval(150)
-        self.scan_log_timer.timeout.connect(self._flush_scan_logs)
-        self.scan_event_timer = QTimer(self)
-        self.scan_event_timer.setInterval(120)
-        self.scan_event_timer.timeout.connect(self._poll_scan_events)
+        self.scan_running = False
+        self.scan_following_url = ""
+        self.scan_pending_candidates: list[dict[str, str]] = []
+        self.scan_results: list[dict[str, str | int | list[str]]] = []
+        self.scan_total_candidates = 0
+        self.scan_worker_states: list[dict[str, object] | None] = [None, None, None, None]
 
         BrowserWindow.open_windows.append(self)
         self._create_toolbar()
@@ -205,7 +203,7 @@ class BrowserWindow(QMainWindow):
         self.start_following_scan(url_text, self.scan_settings_tab)
 
     def start_following_scan(self, url_text: str, settings_tab: SettingsTab) -> None:
-        if self.scan_process is not None and self.scan_process.is_alive():
+        if self.scan_running:
             return
 
         qurl = QUrl(url_text.strip())
@@ -219,6 +217,13 @@ class BrowserWindow(QMainWindow):
 
         scan_tab = self._open_scan_tab()
         scan_tab.set_running(True)
+        scan_tab.clear_workers()
+        self.scan_running = True
+        self.scan_following_url = scan_url
+        self.scan_pending_candidates = []
+        self.scan_results = []
+        self.scan_total_candidates = 0
+        self.scan_worker_states = [None, None, None, None]
         self._enqueue_scan_log(f"Cargando pagina de followings: {scan_url}")
         web_view = scan_tab.web_view
         web_view.setUrl(QUrl(scan_url))
@@ -226,32 +231,28 @@ class BrowserWindow(QMainWindow):
 
         def start_worker_with_html(html: str | None) -> None:
             source_html = html or ""
-            self._cleanup_scan_process()
-            self.scan_queue = mp.Queue()
-            try:
-                parallel_requests = int(
-                    BrowserWindow.app_settings.get(
-                        "scan_parallel_requests", SCAN_MAX_PARALLEL_REQUESTS
-                    )
+            candidates = extract_profile_candidates(scan_url, source_html)
+            if not candidates:
+                self._on_scan_failed(
+                    "No se encontraron perfiles en la pagina. Verifica que el perfil sea visible."
                 )
-            except (TypeError, ValueError):
-                parallel_requests = SCAN_MAX_PARALLEL_REQUESTS
-            self.scan_process = mp.Process(
-                target=run_scan_process,
-                args=(scan_url, source_html, str(SCAN_DB_FILE), self.scan_queue, parallel_requests),
-                daemon=True,
-            )
-            self.scan_process.start()
-            self.scan_event_timer.start()
+                return
+            self.scan_pending_candidates = candidates
+            self.scan_total_candidates = len(candidates)
+            self._enqueue_scan_log(f"Perfiles detectados: {self.scan_total_candidates}")
+            self._enqueue_scan_log("Iniciando 4 QWebEngine para abrir perfiles en paralelo")
+            self._schedule_profile_workers()
 
         def on_load_finished(ok: bool) -> None:
             try:
                 web_view.loadFinished.disconnect(on_load_finished)
             except Exception:
                 pass
+            if not self.scan_running:
+                return
             if not ok:
                 self._enqueue_scan_log(
-                    "No se pudo cargar la pestaña, continuando con requests sin HTML renderizado"
+                    "No se pudo cargar la pestaña, usando HTML vacio para detectar perfiles"
                 )
                 start_worker_with_html(None)
                 return
@@ -276,6 +277,8 @@ class BrowserWindow(QMainWindow):
                         count = int(result)
                     except (TypeError, ValueError):
                         count = 0
+                    if not self.scan_running:
+                        return
                     if count > 0:
                         self._enqueue_scan_log(
                             f"Perfiles visibles detectados: {count}. Capturando HTML renderizado"
@@ -305,13 +308,207 @@ class BrowserWindow(QMainWindow):
                 self.scan_tab = widget
                 return widget
         web_view = self._create_web_view()
-        self.scan_tab = ScanTab(web_view)
+        worker_views = [self._create_web_view() for _ in range(4)]
+        self.scan_tab = ScanTab(web_view, worker_views)
         self.scan_tab.web_view.urlChanged.connect(self._update_url_bar)
+        for idx, worker_view in enumerate(self.scan_tab.worker_views):
+            worker_view.loadFinished.connect(
+                lambda ok, worker_idx=idx: self._on_worker_load_finished(worker_idx, ok)
+            )
         index = self.tabs.addTab(self.scan_tab, "Escaneo")
         self.tabs.setCurrentIndex(index)
         return self.scan_tab
 
+    def _schedule_profile_workers(self) -> None:
+        if self.scan_tab is None or not self.scan_running:
+            return
+        for idx, worker_view in enumerate(self.scan_tab.worker_views):
+            state = self.scan_worker_states[idx]
+            is_busy = bool(state and state.get("busy"))
+            if is_busy or not self.scan_pending_candidates:
+                continue
+            candidate = self.scan_pending_candidates.pop(0)
+            self.scan_worker_states[idx] = {"busy": True, "candidate": candidate}
+            url = str(candidate.get("url", ""))
+            worker_view.setUrl(QUrl(url))
+            QTimer.singleShot(
+                20000, lambda worker_idx=idx, expected_url=url: self._on_worker_timeout(worker_idx, expected_url)
+            )
+            self._enqueue_scan_log(
+                f"[{len(self.scan_results) + 1}/{self.scan_total_candidates}] Worker {idx + 1}: {url}"
+            )
+
+        if (
+            self.scan_running
+            and self.scan_total_candidates > 0
+            and not self.scan_pending_candidates
+            and all(not (state and state.get("busy")) for state in self.scan_worker_states)
+        ):
+            self._finalize_scan_results()
+
+    def _on_worker_load_finished(self, worker_idx: int, ok: bool) -> None:
+        if not self.scan_running or self.scan_tab is None:
+            return
+        state = self.scan_worker_states[worker_idx]
+        if not state or not state.get("busy"):
+            return
+        candidate = state.get("candidate")
+        if not isinstance(candidate, dict):
+            return
+        if not ok:
+            profile_url = str(candidate.get("url", ""))
+            title_hint = str(candidate.get("title_hint", ""))
+            description_hint = str(candidate.get("description_hint", ""))
+            self.scan_results.append(
+                {
+                    "url": profile_url,
+                    "status_code": 0,
+                    "title": title_hint or profile_url.rsplit("/", 1)[-1],
+                    "description": description_hint or "ERROR: no se pudo cargar perfil en QWebEngine",
+                    "urls": [],
+                }
+            )
+            self.scan_worker_states[worker_idx] = {"busy": False, "candidate": None}
+            self._enqueue_scan_log(f"Worker {worker_idx + 1}: fallo de carga")
+            self._schedule_profile_workers()
+            return
+
+        self._collect_worker_data(worker_idx, retries_left=10)
+
+    def _collect_worker_data(self, worker_idx: int, retries_left: int) -> None:
+        if not self.scan_running or self.scan_tab is None:
+            return
+        state = self.scan_worker_states[worker_idx]
+        if not state or not state.get("busy"):
+            return
+        view = self.scan_tab.worker_views[worker_idx]
+        script = """
+        (() => {
+            const userNameNode = document.querySelector('[data-testid="UserName"]');
+            const descNode = document.querySelector('[data-testid="UserDescription"]');
+            const headerItemsNode = document.querySelector('[data-testid="UserProfileHeader_Items"]');
+            const ready = Boolean(userNameNode && (descNode || headerItemsNode));
+            return {
+                ready,
+                pageUrl: location.href || '',
+                hasUserName: Boolean(userNameNode),
+                hasDescription: Boolean(descNode),
+                hasHeaderItems: Boolean(headerItemsNode),
+            };
+        })()
+        """
+        view.page().runJavaScript(
+            script,
+            lambda data: self._on_worker_presence_ready(worker_idx, data, retries_left),
+        )
+
+    def _on_worker_presence_ready(self, worker_idx: int, data: object, retries_left: int) -> None:
+        if not self.scan_running or self.scan_tab is None:
+            return
+        state = self.scan_worker_states[worker_idx]
+        if not state:
+            return
+        candidate = state.get("candidate")
+        if not isinstance(candidate, dict):
+            return
+
+        page_url = ""
+        ready = False
+        if isinstance(data, dict):
+            page_url = str(data.get("pageUrl", "")).lower()
+            ready = bool(data.get("ready", False))
+        if "/i/flow/login" in page_url:
+            ready = True
+        if not ready and retries_left > 0:
+            self.scan_tab.worker_views[worker_idx].page().runJavaScript(
+                "window.scrollBy(0, Math.max(300, window.innerHeight * 0.5));"
+            )
+            QTimer.singleShot(
+                550,
+                lambda: self._collect_worker_data(worker_idx, retries_left - 1),
+            )
+            return
+        self.scan_tab.worker_views[worker_idx].page().toHtml(
+            lambda html: self._on_worker_html_ready(worker_idx, html, page_url)
+        )
+
+    def _on_worker_html_ready(self, worker_idx: int, html: str, page_url: str) -> None:
+        if not self.scan_running:
+            return
+        state = self.scan_worker_states[worker_idx]
+        if not state:
+            return
+        candidate = state.get("candidate")
+        if not isinstance(candidate, dict):
+            return
+
+        profile_url = str(candidate.get("url", ""))
+        title_hint = str(candidate.get("title_hint", ""))
+        description_hint = str(candidate.get("description_hint", ""))
+        row = build_profile_row_from_html(
+            profile_url=profile_url,
+            profile_html=html or "",
+            title_hint=title_hint,
+            description_hint=description_hint,
+            status_code=0 if "/i/flow/login" in page_url else 200,
+        )
+        if row["status_code"] == 0 and not str(row.get("description", "")).strip():
+            row["description"] = "ERROR: redireccionado a login wall"
+        self.scan_results.append(row)
+        self.scan_worker_states[worker_idx] = {"busy": False, "candidate": None}
+        self._enqueue_scan_log(
+            f"[{len(self.scan_results)}/{self.scan_total_candidates}] Worker {worker_idx + 1} finalizado: {profile_url}"
+        )
+        self._schedule_profile_workers()
+
+    def _on_worker_timeout(self, worker_idx: int, expected_url: str) -> None:
+        if not self.scan_running:
+            return
+        state = self.scan_worker_states[worker_idx]
+        if not state or not state.get("busy"):
+            return
+        candidate = state.get("candidate")
+        if not isinstance(candidate, dict):
+            return
+        current_expected = str(candidate.get("url", ""))
+        if current_expected != expected_url:
+            return
+        title_hint = str(candidate.get("title_hint", ""))
+        description_hint = str(candidate.get("description_hint", ""))
+        self.scan_results.append(
+            {
+                "url": expected_url,
+                "status_code": 0,
+                "title": title_hint or expected_url.rsplit("/", 1)[-1],
+                "description": description_hint or "ERROR: timeout en QWebEngine",
+                "urls": [],
+            }
+        )
+        self.scan_worker_states[worker_idx] = {"busy": False, "candidate": None}
+        self._enqueue_scan_log(f"Worker {worker_idx + 1}: timeout en {expected_url}")
+        self._schedule_profile_workers()
+
+    def _finalize_scan_results(self) -> None:
+        if not self.scan_running:
+            return
+        try:
+            scan_id, profiles_found = save_scan_results(
+                db_path=str(SCAN_DB_FILE),
+                following_url=self.scan_following_url,
+                rows=self.scan_results,
+            )
+            self._on_scan_finished(
+                {
+                    "scan_id": scan_id,
+                    "profiles_found": profiles_found,
+                    "db": str(SCAN_DB_FILE),
+                }
+            )
+        except Exception as exc:
+            self._on_scan_failed(f"Error guardando resultados: {exc}")
+
     def _on_scan_finished(self, result: dict) -> None:
+        self.scan_running = False
         if self.scan_tab is not None:
             self.scan_tab.set_running(False)
             self._enqueue_scan_log(
@@ -320,84 +517,22 @@ class BrowserWindow(QMainWindow):
             self._enqueue_scan_log(
                 f"SQLite: {result.get('db', '')} (scan_id={result.get('scan_id', '')})"
             )
-            self._flush_scan_logs()
         self.statusBar().showMessage("Escaneo finalizado", 5000)
         if self.scan_settings_tab is not None:
             self.scan_settings_tab.set_scan_running(False)
 
     def _on_scan_failed(self, error: str) -> None:
+        self.scan_running = False
         if self.scan_tab is not None:
             self.scan_tab.set_running(False)
             self._enqueue_scan_log(f"ERROR: {error}")
-            self._flush_scan_logs()
         self.statusBar().showMessage("Escaneo fallido", 5000)
         if self.scan_settings_tab is not None:
             self.scan_settings_tab.set_scan_running(False)
 
     def _enqueue_scan_log(self, message: str) -> None:
-        self.scan_log_buffer.append(message)
-        if not self.scan_log_timer.isActive():
-            self.scan_log_timer.start()
-
-    def _flush_scan_logs(self) -> None:
-        if self.scan_tab is None:
-            self.scan_log_buffer.clear()
-            self.scan_log_timer.stop()
-            return
-        if not self.scan_log_buffer:
-            self.scan_log_timer.stop()
-            return
-        chunks: list[str] = []
-        while self.scan_log_buffer and len(chunks) < 20:
-            chunks.append(self.scan_log_buffer.popleft())
-        self.scan_tab.log_output.append("\n".join(chunks))
-
-    def _poll_scan_events(self) -> None:
-        if self.scan_queue is None:
-            self.scan_event_timer.stop()
-            return
-        while True:
-            current_queue = self.scan_queue
-            if current_queue is None:
-                self.scan_event_timer.stop()
-                return
-            try:
-                event = current_queue.get_nowait()
-            except Empty:
-                break
-            except (EOFError, OSError, ValueError):
-                self._cleanup_scan_process()
-                return
-
-            event_type = str(event.get("type", ""))
-            if event_type == "progress":
-                self._enqueue_scan_log(str(event.get("message", "")))
-            elif event_type == "finished":
-                self._on_scan_finished(event)
-                self._cleanup_scan_process()
-                return
-            elif event_type == "failed":
-                self._on_scan_failed(str(event.get("error", "Error en escaneo")))
-                self._cleanup_scan_process()
-                return
-
-        if self.scan_process is not None and not self.scan_process.is_alive():
-            self._cleanup_scan_process()
-
-    def _cleanup_scan_process(self) -> None:
-        self.scan_event_timer.stop()
-        if self.scan_process is not None:
-            if self.scan_process.is_alive():
-                self.scan_process.terminate()
-                self.scan_process.join(timeout=1)
-            self.scan_process.close()
-        self.scan_process = None
-        if self.scan_queue is not None:
-            try:
-                self.scan_queue.close()
-            except (OSError, ValueError):
-                pass
-            self.scan_queue = None
+        if self.scan_tab is not None:
+            self.scan_tab.log_output.append(message)
 
     def _save_current_page(self) -> None:
         view = self.current_view()
@@ -418,7 +553,7 @@ class BrowserWindow(QMainWindow):
         view.page().toHtml(_write_html)
 
     def closeEvent(self, event):
-        self._cleanup_scan_process()
+        self.scan_running = False
         remaining = [window for window in BrowserWindow.open_windows if window is not self]
         save_session(remaining if remaining else [self])
         BrowserWindow.open_windows.remove(self)
