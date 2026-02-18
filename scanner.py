@@ -6,6 +6,8 @@ import sqlite3
 from datetime import datetime
 from html import unescape
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
 from bs4.element import Tag
@@ -21,6 +23,7 @@ def clean_text(value: str) -> str:
 
 PROFILE_HANDLE_TAG_RE = re.compile(r"@[A-Za-z0-9_]{1,15}")
 PROFILE_AVATAR_TESTID_RE = re.compile(r"^UserAvatar-Container-")
+PROFILE_AVATAR_HANDLE_RE = re.compile(r"^UserAvatar-Container-([A-Za-z0-9_]{1,15})$")
 
 
 def profile_handle_from_url(profile_url: str) -> str:
@@ -114,6 +117,91 @@ def extract_urls_from_banner(banner: Tag | None) -> list[str]:
             seen.add(href)
             candidates.append(href)
     return candidates
+
+
+def extract_handle_from_banner(banner: Tag | None) -> str:
+    if banner is None:
+        return ""
+    avatar = banner.find(attrs={"data-testid": PROFILE_AVATAR_TESTID_RE})
+    if isinstance(avatar, Tag):
+        testid = str(avatar.get("data-testid", "")).strip()
+        match = PROFILE_AVATAR_HANDLE_RE.fullmatch(testid)
+        if match:
+            return match.group(1)
+
+    name_node = banner.find(attrs={"data-testid": "UserName"})
+    if isinstance(name_node, Tag):
+        for text in name_node.stripped_strings:
+            value = clean_text(text)
+            match = PROFILE_HANDLE_TAG_RE.fullmatch(value)
+            if match:
+                return value.lstrip("@")
+    return ""
+
+
+def is_tco_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url.strip())
+    except ValueError:
+        return False
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = parsed.netloc.lower().split(":")[0]
+    return host == "t.co"
+
+
+def resolve_short_url(url: str, timeout_s: float = 6.0) -> str:
+    candidate = url.strip()
+    if not candidate or not is_tco_url(candidate):
+        return candidate
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
+        )
+    }
+    methods = ("HEAD", "GET")
+    timeout = max(1.0, float(timeout_s))
+    for method in methods:
+        try:
+            request = Request(candidate, headers=headers, method=method)
+            with urlopen(request, timeout=timeout) as response:
+                final_url = str(response.geturl() or "").strip()
+                if final_url:
+                    return final_url
+        except Exception:
+            continue
+    return candidate
+
+
+def resolve_profile_urls(
+    urls: list[str],
+    cache: dict[str, str] | None = None,
+    timeout_s: float = 6.0,
+    resolve_tco: bool = True,
+) -> list[str]:
+    if not urls:
+        return []
+    cache_ref: dict[str, str] = cache if cache is not None else {}
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for raw_url in urls:
+        url = str(raw_url).strip()
+        if not url:
+            continue
+        final_url = url
+        if resolve_tco and is_tco_url(url):
+            if url in cache_ref:
+                final_url = cache_ref[url]
+            else:
+                final_url = resolve_short_url(url, timeout_s=timeout_s)
+                cache_ref[url] = final_url
+        if final_url in seen:
+            continue
+        seen.add(final_url)
+        resolved.append(final_url)
+    return resolved
 
 
 def extract_title(html: str, profile_url: str) -> str:
@@ -307,6 +395,9 @@ def build_profile_row_from_html(
     title_hint: str = "",
     description_hint: str = "",
     status_code: int = 200,
+    resolve_tco: bool = True,
+    resolve_timeout_s: float = 6.0,
+    url_cache: dict[str, str] | None = None,
 ) -> dict[str, str | int | list[str]]:
     profile_handle = profile_handle_from_url(profile_url)
     soup = BeautifulSoup(profile_html, "html.parser")
@@ -317,13 +408,19 @@ def build_profile_row_from_html(
     description = extract_description_from_banner(banner)
     if not description and description_hint:
         description = description_hint
-    urls = extract_urls_from_banner(banner)
+    urls = resolve_profile_urls(
+        extract_urls_from_banner(banner),
+        cache=url_cache,
+        timeout_s=resolve_timeout_s,
+        resolve_tco=resolve_tco,
+    )
     return {
         "url": profile_url,
         "status_code": status_code,
         "title": title,
         "description": description,
         "urls": urls,
+        "detected_handle": extract_handle_from_banner(banner),
     }
 
 

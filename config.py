@@ -19,6 +19,11 @@ DEFAULT_URL = "https://www.google.com"
 POPUP_URL = "about:blank"
 DEFAULT_FOLLOWING_SCAN_URL = "https://x.com/my_profile/following"
 SCAN_MAX_PARALLEL_REQUESTS = 4
+SCAN_FOLLOWING_MAX_SCROLL_ROUNDS = 60
+SCAN_FOLLOWING_MAX_PROFILES = 800
+SCAN_FOLLOWING_MAX_IDLE_ROUNDS = 3
+SCAN_RESOLVE_TCO = True
+SCAN_URL_RESOLVE_TIMEOUT_S = 6
 
 
 class HasTabUrls(Protocol):
@@ -82,14 +87,19 @@ def save_session(windows: Iterable[HasTabUrls] | None) -> None:
         json.dump({"windows": data}, handle, indent=2)
 
 
-def default_settings() -> dict[str, str | bool | int]:
+def default_settings() -> dict[str, str | bool | int | float]:
     return {
         "following_scan_url": DEFAULT_FOLLOWING_SCAN_URL,
         "scan_parallel_requests": SCAN_MAX_PARALLEL_REQUESTS,
+        "scan_following_max_scroll_rounds": SCAN_FOLLOWING_MAX_SCROLL_ROUNDS,
+        "scan_following_max_profiles": SCAN_FOLLOWING_MAX_PROFILES,
+        "scan_following_max_idle_rounds": SCAN_FOLLOWING_MAX_IDLE_ROUNDS,
+        "scan_resolve_tco": SCAN_RESOLVE_TCO,
+        "scan_url_resolve_timeout_s": SCAN_URL_RESOLVE_TIMEOUT_S,
     }
 
 
-def load_settings() -> dict[str, str | bool | int]:
+def load_settings() -> dict[str, str | bool | int | float]:
     if not SETTINGS_FILE.exists():
         return default_settings()
     try:
@@ -103,6 +113,6 @@ def load_settings() -> dict[str, str | bool | int]:
     return default_settings()
 
 
-def save_settings(settings: dict[str, str | bool | int]) -> None:
+def save_settings(settings: dict[str, str | bool | int | float]) -> None:
     with SETTINGS_FILE.open("w", encoding="utf-8") as handle:
         json.dump(settings, handle, indent=2)

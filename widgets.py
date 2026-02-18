@@ -5,24 +5,37 @@ from PyQt6.QtCore import QUrl
 from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
-    QFormLayout, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy,
-    QSplitter, QTextEdit, QVBoxLayout, QWidget
+    QCheckBox, QFormLayout, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+    QSizePolicy, QSplitter, QTextEdit, QVBoxLayout, QWidget
 )
 
 from config import DEFAULT_FOLLOWING_SCAN_URL, POPUP_URL
 
 class SettingsTab(QWidget):
     def __init__(
-        self,     initial_url: str,
-        on_scan: Callable[[str], None],
-        on_save: Callable[[str], None],
+        self,
+        initial_settings: dict[str, str | bool | int | float],
+        on_scan: Callable[[dict[str, str | bool | int | float]], None],
+        on_save: Callable[[dict[str, str | bool | int | float]], None],
     ) -> None:
         super().__init__()
         self._on_scan = on_scan
         self._on_save = on_save
-        self._build_ui(initial_url)
+        self._build_ui(initial_settings)
 
-    def _build_ui(self, initial_url: str) -> None:
+    def _build_ui(self, initial_settings: dict[str, str | bool | int | float]) -> None:
+        def as_int(value: object, default: int) -> int:
+            try:
+                return int(value)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return default
+
+        def as_float(value: object, default: float) -> float:
+            try:
+                return float(value)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return default
+
         layout = QVBoxLayout()
         self.setLayout(layout)
 
@@ -30,6 +43,7 @@ class SettingsTab(QWidget):
         title.setStyleSheet("font-weight: bold; font-size: 16px;")
         layout.addWidget(title)
 
+        initial_url = str(initial_settings.get("following_scan_url", DEFAULT_FOLLOWING_SCAN_URL))
         form = QFormLayout()
         self.following_url_input = QLineEdit()
         self.following_url_input.setText(initial_url or DEFAULT_FOLLOWING_SCAN_URL)
@@ -43,6 +57,34 @@ class SettingsTab(QWidget):
         url_row_layout.addWidget(self.scan_button)
         url_row.setLayout(url_row_layout)
         form.addRow("URL para escanear followings:", url_row)
+
+        self.max_scroll_rounds_input = QLineEdit()
+        self.max_scroll_rounds_input.setText(
+            str(as_int(initial_settings.get("scan_following_max_scroll_rounds", 60), 60))
+        )
+        form.addRow("Max scroll rounds:", self.max_scroll_rounds_input)
+
+        self.max_profiles_input = QLineEdit()
+        self.max_profiles_input.setText(
+            str(as_int(initial_settings.get("scan_following_max_profiles", 800), 800))
+        )
+        form.addRow("Max perfiles:", self.max_profiles_input)
+
+        self.max_idle_rounds_input = QLineEdit()
+        self.max_idle_rounds_input.setText(
+            str(as_int(initial_settings.get("scan_following_max_idle_rounds", 3), 3))
+        )
+        form.addRow("Idle rounds:", self.max_idle_rounds_input)
+
+        self.resolve_tco_checkbox = QCheckBox("Resolver enlaces t.co")
+        self.resolve_tco_checkbox.setChecked(bool(initial_settings.get("scan_resolve_tco", True)))
+        form.addRow("Resolucion links:", self.resolve_tco_checkbox)
+
+        self.resolve_timeout_input = QLineEdit()
+        self.resolve_timeout_input.setText(
+            str(as_float(initial_settings.get("scan_url_resolve_timeout_s", 6), 6.0))
+        )
+        form.addRow("Timeout t.co (1-20s):", self.resolve_timeout_input)
         layout.addLayout(form)
 
         save_button = QPushButton("Guardar configuracion")
@@ -54,15 +96,48 @@ class SettingsTab(QWidget):
         layout.addStretch()
 
     def _save(self) -> None:
-        self._on_save(self.following_url_input.text().strip())
+        settings_values = self._collect_settings_values()
+        if settings_values is None:
+            return
+        self._on_save(settings_values)
         self.status_label.setText("Configuracion guardada")
 
     def _start_scan(self) -> None:
-        self._on_scan(self.following_url_input.text().strip())
+        settings_values = self._collect_settings_values()
+        if settings_values is None:
+            return
+        self._on_scan(settings_values)
 
     def set_scan_running(self, running: bool) -> None:
         self.scan_button.setEnabled(not running)
         self.scan_button.setText("Escaneando..." if running else "Escanear")
+
+    def _collect_settings_values(self) -> dict[str, str | bool | int | float] | None:
+        url = self.following_url_input.text().strip()
+        try:
+            max_scroll_rounds = int(self.max_scroll_rounds_input.text().strip())
+            max_profiles = int(self.max_profiles_input.text().strip())
+            max_idle_rounds = int(self.max_idle_rounds_input.text().strip())
+            resolve_timeout = float(self.resolve_timeout_input.text().strip())
+        except ValueError:
+            self.status_label.setText("Valores invalidos: revisa los numeros")
+            return None
+
+        if max_scroll_rounds <= 0 or max_profiles <= 0 or max_idle_rounds <= 0:
+            self.status_label.setText("Max scroll/perfiles/idle deben ser > 0")
+            return None
+        if resolve_timeout < 1 or resolve_timeout > 20:
+            self.status_label.setText("Timeout t.co debe estar entre 1 y 20 segundos")
+            return None
+
+        return {
+            "following_scan_url": url or DEFAULT_FOLLOWING_SCAN_URL,
+            "scan_following_max_scroll_rounds": max_scroll_rounds,
+            "scan_following_max_profiles": max_profiles,
+            "scan_following_max_idle_rounds": max_idle_rounds,
+            "scan_resolve_tco": self.resolve_tco_checkbox.isChecked(),
+            "scan_url_resolve_timeout_s": resolve_timeout,
+        }
 
 
 class WebEngineView(QWebEngineView):
