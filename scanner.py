@@ -7,7 +7,6 @@ from datetime import datetime
 from html import unescape
 from pathlib import Path
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
 from bs4.element import Tag
@@ -150,60 +149,6 @@ def is_tco_url(url: str) -> bool:
     return host == "t.co"
 
 
-def resolve_short_url(url: str, timeout_s: float = 6.0) -> str:
-    candidate = url.strip()
-    if not candidate or not is_tco_url(candidate):
-        return candidate
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
-        )
-    }
-    methods = ("HEAD", "GET")
-    timeout = max(1.0, float(timeout_s))
-    for method in methods:
-        try:
-            request = Request(candidate, headers=headers, method=method)
-            with urlopen(request, timeout=timeout) as response:
-                final_url = str(response.geturl() or "").strip()
-                if final_url:
-                    return final_url
-        except Exception:
-            continue
-    return candidate
-
-
-def resolve_profile_urls(
-    urls: list[str],
-    cache: dict[str, str] | None = None,
-    timeout_s: float = 6.0,
-    resolve_tco: bool = True,
-) -> list[str]:
-    if not urls:
-        return []
-    cache_ref: dict[str, str] = cache if cache is not None else {}
-    resolved: list[str] = []
-    seen: set[str] = set()
-    for raw_url in urls:
-        url = str(raw_url).strip()
-        if not url:
-            continue
-        final_url = url
-        if resolve_tco and is_tco_url(url):
-            if url in cache_ref:
-                final_url = cache_ref[url]
-            else:
-                final_url = resolve_short_url(url, timeout_s=timeout_s)
-                cache_ref[url] = final_url
-        if final_url in seen:
-            continue
-        seen.add(final_url)
-        resolved.append(final_url)
-    return resolved
-
-
 def extract_title(html: str, profile_url: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     banner = find_profile_banner(soup)
@@ -278,6 +223,31 @@ def extract_profile_candidates(following_url: str, html: str) -> list[dict[str, 
         "click to unfollow",
         "unfollow ",
     )
+
+    def extract_following_name(cell: Tag, handle: str) -> str:
+        handle_lower = handle.lower()
+        handle_tag = f"@{handle_lower}"
+        for anchor in cell.find_all("a", href=True):
+            href = str(anchor.get("href", "")).strip()
+            match = re.fullmatch(r"/([A-Za-z0-9_]{1,15})", href)
+            if not match or match.group(1).lower() != handle_lower:
+                continue
+            unique_texts: list[str] = []
+            for text in anchor.stripped_strings:
+                value = clean_text(text)
+                if value and value not in unique_texts:
+                    unique_texts.append(value)
+            for value in unique_texts:
+                lower = value.lower()
+                if any(lower.startswith(prefix) for prefix in ignored_prefixes):
+                    continue
+                if lower == handle_lower or lower == handle_tag or lower in ignored_tokens:
+                    continue
+                if value.startswith("@"):
+                    continue
+                return value
+        return ""
+
     candidates: list[dict[str, str]] = []
     seen: set[str] = set()
 
@@ -322,6 +292,7 @@ def extract_profile_candidates(following_url: str, html: str) -> list[dict[str, 
         candidates.append(
             {
                 "url": f"https://x.com/{handle}",
+                "following_name": extract_following_name(cell, handle),
                 "title_hint": title_hint,
                 "description_hint": description_hint,
             }
@@ -356,37 +327,156 @@ def ensure_scan_db(db_path: str) -> sqlite3.Connection:
     target = Path(db_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(target))
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS scans (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            following_url TEXT NOT NULL,
-            profiles_found INTEGER NOT NULL,
-            generated_at TEXT NOT NULL
-        )
-        """
-    )
+    existing_tables = {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    if "profiles" in existing_tables:
+        existing_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(profiles)").fetchall()
+        }
+        if "scan_id" in existing_columns:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS profiles_v2 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    generated_at TEXT NOT NULL,
+                    profile_url TEXT NOT NULL,
+                    status_code INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    urls TEXT NOT NULL DEFAULT '[]'
+                )
+                """
+            )
+            if "scans" in existing_tables:
+                conn.execute(
+                    """
+                    INSERT INTO profiles_v2 (
+                        generated_at,
+                        profile_url,
+                        status_code,
+                        title,
+                        description,
+                        urls
+                    )
+                    SELECT
+                        COALESCE(scans.generated_at, ''),
+                        profiles.profile_url,
+                        profiles.status_code,
+                        profiles.title,
+                        profiles.description,
+                        COALESCE(profiles.urls, '[]')
+                    FROM profiles
+                    LEFT JOIN scans ON scans.id = profiles.scan_id
+                    """
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO profiles_v2 (
+                        generated_at,
+                        profile_url,
+                        status_code,
+                        title,
+                        description,
+                        urls
+                    )
+                    SELECT
+                        '',
+                        profile_url,
+                        status_code,
+                        title,
+                        description,
+                        COALESCE(urls, '[]')
+                    FROM profiles
+                    """
+                )
+            conn.execute("DROP TABLE profiles")
+            conn.execute("ALTER TABLE profiles_v2 RENAME TO profiles")
+            existing_tables = {
+                str(row[0])
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            }
+            existing_columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(profiles)").fetchall()
+            }
+        if "following_url" in existing_columns:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS profiles_v3 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    generated_at TEXT NOT NULL,
+                    profile_url TEXT NOT NULL,
+                    status_code INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    urls TEXT NOT NULL DEFAULT '[]'
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO profiles_v3 (
+                    generated_at,
+                    profile_url,
+                    status_code,
+                    title,
+                    description,
+                    urls
+                )
+                SELECT
+                    COALESCE(generated_at, ''),
+                    profile_url,
+                    status_code,
+                    title,
+                    description,
+                    COALESCE(urls, '[]')
+                FROM profiles
+                """
+            )
+            conn.execute("DROP TABLE profiles")
+            conn.execute("ALTER TABLE profiles_v3 RENAME TO profiles")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS profiles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            scan_id INTEGER NOT NULL,
+            generated_at TEXT NOT NULL,
             profile_url TEXT NOT NULL,
             status_code INTEGER NOT NULL,
             title TEXT NOT NULL,
             description TEXT NOT NULL,
-            urls TEXT NOT NULL DEFAULT '[]',
-            FOREIGN KEY(scan_id) REFERENCES scans(id)
+            urls TEXT NOT NULL DEFAULT '[]'
         )
         """
     )
+    if "scans" in existing_tables:
+        conn.execute("DROP TABLE scans")
     existing_columns = {
         str(row[1]) for row in conn.execute("PRAGMA table_info(profiles)").fetchall()
     }
+    if "generated_at" not in existing_columns:
+        conn.execute("ALTER TABLE profiles ADD COLUMN generated_at TEXT NOT NULL DEFAULT ''")
     if "urls" not in existing_columns:
         conn.execute("ALTER TABLE profiles ADD COLUMN urls TEXT NOT NULL DEFAULT '[]'")
     conn.commit()
     return conn
+
+
+def get_success_profile_urls(db_path: str, urls: list[str]) -> set[str]:
+    normalized = [str(url).strip().lower() for url in urls if str(url).strip()]
+    if not normalized:
+        return set()
+    conn = ensure_scan_db(db_path)
+    placeholders = ", ".join("?" for _ in normalized)
+    query = (
+        "SELECT LOWER(profile_url) "
+        "FROM profiles "
+        "WHERE status_code = 200 AND LOWER(profile_url) IN ({})".format(placeholders)
+    )
+    rows = conn.execute(query, normalized).fetchall()
+    conn.close()
+    return {str(row[0]) for row in rows if row and row[0]}
 
 
 def build_profile_row_from_html(
@@ -395,9 +485,6 @@ def build_profile_row_from_html(
     title_hint: str = "",
     description_hint: str = "",
     status_code: int = 200,
-    resolve_tco: bool = True,
-    resolve_timeout_s: float = 6.0,
-    url_cache: dict[str, str] | None = None,
 ) -> dict[str, str | int | list[str]]:
     profile_handle = profile_handle_from_url(profile_url)
     soup = BeautifulSoup(profile_html, "html.parser")
@@ -408,12 +495,7 @@ def build_profile_row_from_html(
     description = extract_description_from_banner(banner)
     if not description and description_hint:
         description = description_hint
-    urls = resolve_profile_urls(
-        extract_urls_from_banner(banner),
-        cache=url_cache,
-        timeout_s=resolve_timeout_s,
-        resolve_tco=resolve_tco,
-    )
+    urls = extract_urls_from_banner(banner)
     return {
         "url": profile_url,
         "status_code": status_code,
@@ -426,21 +508,17 @@ def build_profile_row_from_html(
 
 def save_scan_results(
     db_path: str,
-    following_url: str,
     rows: list[dict[str, str | int | list[str]]],
-) -> tuple[int, int]:
+) -> int:
     profile_count = len(rows)
+    if profile_count == 0:
+        return 0
     conn = ensure_scan_db(db_path)
     generated_at = datetime.now().isoformat()
-    cursor = conn.execute(
-        "INSERT INTO scans (following_url, profiles_found, generated_at) VALUES (?, ?, ?)",
-        (following_url, profile_count, generated_at),
-    )
-    scan_id = int(cursor.lastrowid)
     conn.executemany(
         """
         INSERT INTO profiles (
-            scan_id,
+            generated_at,
             profile_url,
             status_code,
             title,
@@ -451,7 +529,7 @@ def save_scan_results(
         """,
         [
             (
-                scan_id,
+                generated_at,
                 str(item["url"]),
                 int(item["status_code"]),
                 str(item["title"]),
@@ -463,4 +541,4 @@ def save_scan_results(
     )
     conn.commit()
     conn.close()
-    return scan_id, profile_count
+    return profile_count

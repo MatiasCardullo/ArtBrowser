@@ -21,9 +21,9 @@ DEFAULT_FOLLOWING_SCAN_URL = "https://x.com/my_profile/following"
 SCAN_MAX_PARALLEL_REQUESTS = 4
 SCAN_FOLLOWING_MAX_SCROLL_ROUNDS = 60
 SCAN_FOLLOWING_MAX_PROFILES = 800
-SCAN_FOLLOWING_MAX_IDLE_ROUNDS = 3
 SCAN_RESOLVE_TCO = True
 SCAN_URL_RESOLVE_TIMEOUT_S = 6
+SCAN_SKIP_ALREADY_OK = True
 
 
 class HasTabUrls(Protocol):
@@ -93,9 +93,9 @@ def default_settings() -> dict[str, str | bool | int | float]:
         "scan_parallel_requests": SCAN_MAX_PARALLEL_REQUESTS,
         "scan_following_max_scroll_rounds": SCAN_FOLLOWING_MAX_SCROLL_ROUNDS,
         "scan_following_max_profiles": SCAN_FOLLOWING_MAX_PROFILES,
-        "scan_following_max_idle_rounds": SCAN_FOLLOWING_MAX_IDLE_ROUNDS,
         "scan_resolve_tco": SCAN_RESOLVE_TCO,
         "scan_url_resolve_timeout_s": SCAN_URL_RESOLVE_TIMEOUT_S,
+        "scan_skip_already_ok": SCAN_SKIP_ALREADY_OK,
     }
 
 

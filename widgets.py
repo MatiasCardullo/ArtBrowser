@@ -70,15 +70,15 @@ class SettingsTab(QWidget):
         )
         form.addRow("Max perfiles:", self.max_profiles_input)
 
-        self.max_idle_rounds_input = QLineEdit()
-        self.max_idle_rounds_input.setText(
-            str(as_int(initial_settings.get("scan_following_max_idle_rounds", 3), 3))
-        )
-        form.addRow("Idle rounds:", self.max_idle_rounds_input)
-
         self.resolve_tco_checkbox = QCheckBox("Resolver enlaces t.co")
         self.resolve_tco_checkbox.setChecked(bool(initial_settings.get("scan_resolve_tco", True)))
         form.addRow("Resolucion links:", self.resolve_tco_checkbox)
+
+        self.skip_already_ok_checkbox = QCheckBox("Saltar perfiles ya OK (status 200)")
+        self.skip_already_ok_checkbox.setChecked(
+            bool(initial_settings.get("scan_skip_already_ok", True))
+        )
+        form.addRow("Reusar resultados:", self.skip_already_ok_checkbox)
 
         self.resolve_timeout_input = QLineEdit()
         self.resolve_timeout_input.setText(
@@ -117,14 +117,13 @@ class SettingsTab(QWidget):
         try:
             max_scroll_rounds = int(self.max_scroll_rounds_input.text().strip())
             max_profiles = int(self.max_profiles_input.text().strip())
-            max_idle_rounds = int(self.max_idle_rounds_input.text().strip())
             resolve_timeout = float(self.resolve_timeout_input.text().strip())
         except ValueError:
             self.status_label.setText("Valores invalidos: revisa los numeros")
             return None
 
-        if max_scroll_rounds <= 0 or max_profiles <= 0 or max_idle_rounds <= 0:
-            self.status_label.setText("Max scroll/perfiles/idle deben ser > 0")
+        if max_scroll_rounds <= 0 or max_profiles <= 0:
+            self.status_label.setText("Max scroll/perfiles deben ser > 0")
             return None
         if resolve_timeout < 1 or resolve_timeout > 20:
             self.status_label.setText("Timeout t.co debe estar entre 1 y 20 segundos")
@@ -134,9 +133,9 @@ class SettingsTab(QWidget):
             "following_scan_url": url or DEFAULT_FOLLOWING_SCAN_URL,
             "scan_following_max_scroll_rounds": max_scroll_rounds,
             "scan_following_max_profiles": max_profiles,
-            "scan_following_max_idle_rounds": max_idle_rounds,
             "scan_resolve_tco": self.resolve_tco_checkbox.isChecked(),
             "scan_url_resolve_timeout_s": resolve_timeout,
+            "scan_skip_already_ok": self.skip_already_ok_checkbox.isChecked(),
         }
 
 
