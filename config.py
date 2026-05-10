@@ -1,6 +1,7 @@
 """Application config and persistence helpers."""
 
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Iterable, Protocol
@@ -13,7 +14,7 @@ SESSION_FILE = BASE_DIR / "session.json"
 SETTINGS_FILE = BASE_DIR / "settings.json"
 PROFILE_DIR = BASE_DIR / "profile_data"
 OLD_PROFILE_DIR = BASE_DIR / "profile_storage"
-SCAN_DB_FILE = BASE_DIR / "scan_results" / "followings.db"
+SCAN_DB_TABLE = "twitter_profiles"
 
 DEFAULT_URL = "https://www.google.com"
 POPUP_URL = "about:blank"
@@ -22,8 +23,12 @@ SCAN_MAX_PARALLEL_REQUESTS = 4
 SCAN_FOLLOWING_MAX_SCROLL_ROUNDS = 60
 SCAN_FOLLOWING_MAX_PROFILES = 800
 SCAN_RESOLVE_TCO = True
-SCAN_URL_RESOLVE_TIMEOUT_S = 6
 SCAN_SKIP_ALREADY_OK = True
+MYSQL_HOST = os.getenv("ARTBROWSER_MYSQL_HOST", "127.0.0.1")
+MYSQL_PORT = int(os.getenv("ARTBROWSER_MYSQL_PORT", "3306"))
+MYSQL_DATABASE = os.getenv("ARTBROWSER_MYSQL_DATABASE", "artbrowser")
+MYSQL_USER = os.getenv("ARTBROWSER_MYSQL_USER", "root")
+MYSQL_PASSWORD = os.getenv("ARTBROWSER_MYSQL_PASSWORD", "")
 
 
 class HasTabUrls(Protocol):
@@ -94,8 +99,12 @@ def default_settings() -> dict[str, str | bool | int | float]:
         "scan_following_max_scroll_rounds": SCAN_FOLLOWING_MAX_SCROLL_ROUNDS,
         "scan_following_max_profiles": SCAN_FOLLOWING_MAX_PROFILES,
         "scan_resolve_tco": SCAN_RESOLVE_TCO,
-        "scan_url_resolve_timeout_s": SCAN_URL_RESOLVE_TIMEOUT_S,
         "scan_skip_already_ok": SCAN_SKIP_ALREADY_OK,
+        "mysql_host": MYSQL_HOST,
+        "mysql_port": MYSQL_PORT,
+        "mysql_database": MYSQL_DATABASE,
+        "mysql_user": MYSQL_USER,
+        "mysql_password": MYSQL_PASSWORD,
     }
 
 

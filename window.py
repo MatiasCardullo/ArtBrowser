@@ -1,9 +1,10 @@
 """Main window implementation."""
 
 import re
+import time
 from datetime import datetime
 
-from PyQt6.QtCore import QEventLoop, QTimer, QUrl
+from PyQt6.QtCore import QTimer, QUrl
 from PyQt6.QtGui import QAction
 from PyQt6.QtWebEngineCore import QWebEngineProfile
 from PyQt6.QtWidgets import (
@@ -11,19 +12,18 @@ from PyQt6.QtWidgets import (
 )
 
 from config import (
-    BASE_DIR, DEFAULT_URL, SCAN_DB_FILE,
+    BASE_DIR, DEFAULT_URL, SCAN_DB_TABLE,
     SCAN_FOLLOWING_MAX_PROFILES,
     SCAN_FOLLOWING_MAX_SCROLL_ROUNDS,
     SCAN_SKIP_ALREADY_OK,
-    SCAN_RESOLVE_TCO,
-    SCAN_URL_RESOLVE_TIMEOUT_S,
     save_session, save_settings
 )
 from scanner import (
     build_profile_row_from_html,
+    extract_handles_from_description,
     extract_profile_candidates,
+    extract_urls_from_html_document,
     get_success_profile_urls,
-    is_tco_url,
     save_scan_results,
 )
 from widgets import ScanTab, SettingsTab, WebEngineView
@@ -33,6 +33,11 @@ class BrowserWindow(QMainWindow):
     open_windows = []
     profile: QWebEngineProfile | None = None
     app_settings: dict[str, str | bool | int | float] = {}
+    LINK_VISIBLE_DWELL_MS = 8000
+    LINK_STABILIZE_MS = 1200
+    LINK_LOAD_WATCHDOG_MS = 45000
+    LINK_EXPANSION_HOSTS = {"carrd.co", "crd.co", "linktr.ee", "potofu.me"}
+    LINK_NO_OPEN_HOSTS = {"discord.gg"}
 
     def __init__(self, initial_urls: list[str] | None = None) -> None:
         super().__init__()
@@ -45,6 +50,9 @@ class BrowserWindow(QMainWindow):
         self.scan_pending_candidates: list[dict[str, str]] = []
         self.scan_results: list[dict[str, str | int | list[str]]] = []
         self.scan_saved_count = 0
+        self.scan_active_workers = 4
+        self.scan_max_profiles = 800
+        self.scan_known_profile_urls: set[str] = set()
         self.scan_total_candidates = 0
         self.scan_worker_states: list[dict[str, object] | None] = [None, None, None, None]
         self.scan_url_resolve_cache: dict[str, str] = {}
@@ -213,11 +221,16 @@ class BrowserWindow(QMainWindow):
             qurl.setScheme("https")
         BrowserWindow.app_settings["following_scan_url"] = qurl.toString()
         for key in (
+            "scan_parallel_requests",
             "scan_following_max_scroll_rounds",
             "scan_following_max_profiles",
             "scan_resolve_tco",
-            "scan_url_resolve_timeout_s",
             "scan_skip_already_ok",
+            "mysql_host",
+            "mysql_port",
+            "mysql_database",
+            "mysql_user",
+            "mysql_password",
         ):
             if key in values:
                 BrowserWindow.app_settings[key] = values[key]
@@ -244,6 +257,8 @@ class BrowserWindow(QMainWindow):
         scan_tab = self._open_scan_tab()
         scan_tab.set_running(True)
         scan_tab.clear_workers()
+        self.scan_active_workers = self._scan_parallel_workers()
+        scan_tab.set_active_workers(self.scan_active_workers)
         self.scan_running = True
         self.scan_following_url = scan_url
         self.scan_pending_candidates = []
@@ -263,6 +278,7 @@ class BrowserWindow(QMainWindow):
         max_profiles = self._scan_setting_int(
             "scan_following_max_profiles", SCAN_FOLLOWING_MAX_PROFILES, minimum=1
         )
+        self.scan_max_profiles = max_profiles
         self._enqueue_scan_log(
             "Recolector followings: "
             f"max_rounds={max_scroll_rounds}, max_profiles={max_profiles}"
@@ -274,6 +290,9 @@ class BrowserWindow(QMainWindow):
         def finalize_candidate_collection(reason: str) -> None:
             if not self.scan_running:
                 return
+            # Freeze followings page once candidates are collected; workers no longer need it.
+            web_view.stop()
+            web_view.setUrl(QUrl("about:blank"))
             if not collected_candidates:
                 self._on_scan_failed(
                     "No se encontraron perfiles en la pagina. Verifica que el perfil sea visible."
@@ -286,7 +305,7 @@ class BrowserWindow(QMainWindow):
                     for item in self.scan_pending_candidates
                     if str(item.get("url", "")).strip()
                 ]
-                existing_urls = get_success_profile_urls(str(SCAN_DB_FILE), candidate_urls)
+                existing_urls = get_success_profile_urls(self._scan_db_config(), candidate_urls)
                 if existing_urls:
                     before_count = len(self.scan_pending_candidates)
                     self.scan_pending_candidates = [
@@ -296,9 +315,14 @@ class BrowserWindow(QMainWindow):
                     ]
                     skipped = before_count - len(self.scan_pending_candidates)
                     self._enqueue_scan_log(
-                        f"Saltados por cache SQLite status=200: {skipped}"
+                        f"Saltados por cache MySQL status=200: {skipped}"
                     )
             self.scan_total_candidates = len(self.scan_pending_candidates)
+            self.scan_known_profile_urls = {
+                str(item.get("url", "")).strip().lower()
+                for item in self.scan_pending_candidates
+                if str(item.get("url", "")).strip()
+            }
             self._enqueue_scan_log(
                 f"Recoleccion finalizada ({reason}). Perfiles detectados: {self.scan_total_candidates}"
             )
@@ -306,11 +330,13 @@ class BrowserWindow(QMainWindow):
                 self._on_scan_finished(
                     {
                         "profiles_found": self.scan_saved_count,
-                        "db": str(SCAN_DB_FILE),
+                        "db": self._scan_db_label(),
                     }
                 )
                 return
-            self._enqueue_scan_log("Iniciando 4 QWebEngine para abrir perfiles en paralelo")
+            self._enqueue_scan_log(
+                f"Iniciando {self.scan_active_workers} QWebEngine para abrir perfiles en paralelo"
+            )
             self._schedule_profile_workers()
 
         def collect_candidates_round(round_idx: int) -> None:
@@ -458,12 +484,19 @@ class BrowserWindow(QMainWindow):
         self.tabs.setCurrentIndex(index)
         return self.scan_tab
 
+    def _scan_parallel_workers(self) -> int:
+        value = self._scan_setting_int("scan_parallel_requests", 4, minimum=2)
+        return 4 if value >= 4 else 2
+
     def _schedule_profile_workers(self) -> None:
         if self.scan_tab is None or not self.scan_running:
             return
-        for idx, worker_view in enumerate(self.scan_tab.worker_views):
+        for idx, worker_view in enumerate(self.scan_tab.worker_views[:self.scan_active_workers]):
             state = self.scan_worker_states[idx]
             is_busy = bool(state and state.get("busy"))
+            if is_busy and isinstance(state, dict):
+                # Hard guard: never reassign a worker until explicit finalization path clears busy.
+                continue
             if is_busy or not self.scan_pending_candidates:
                 continue
             candidate = self.scan_pending_candidates.pop(0)
@@ -474,7 +507,6 @@ class BrowserWindow(QMainWindow):
             }
             url = str(candidate.get("url", ""))
             worker_view.setUrl(QUrl(url))
-            self._arm_worker_timeout(idx, url)
             self._enqueue_scan_log(
                 f"[{len(self.scan_results) + 1}/{self.scan_total_candidates}] Worker {idx + 1}: {url}"
             )
@@ -483,7 +515,10 @@ class BrowserWindow(QMainWindow):
             self.scan_running
             and self.scan_total_candidates > 0
             and not self.scan_pending_candidates
-            and all(not (state and state.get("busy")) for state in self.scan_worker_states)
+            and all(
+                not (state and state.get("busy"))
+                for state in self.scan_worker_states[:self.scan_active_workers]
+            )
         ):
             self._finalize_scan_results()
 
@@ -590,16 +625,53 @@ class BrowserWindow(QMainWindow):
             return
 
         profile_url = str(candidate.get("url", ""))
-        title_hint = str(candidate.get("title_hint", ""))
-        description_hint = str(candidate.get("description_hint", ""))
         expected_handle = profile_url.rstrip("/").rsplit("/", 1)[-1].lower()
+        host_ok = self._is_x_profile_host(page_url)
+        handle_in_url = bool(page_url and f"/{expected_handle}" in page_url)
+        if page_url and (not host_ok or ("/i/flow/login" not in page_url and not handle_in_url)):
+            if retries_left > 0:
+                self._enqueue_scan_log(
+                    f"Worker {worker_idx + 1}: URL no confiable para {expected_handle}, reintentando..."
+                )
+                self.scan_tab.worker_views[worker_idx].setUrl(QUrl(profile_url))
+                return
+            row = {
+                "url": profile_url,
+                "status_code": 0,
+                "title": expected_handle,
+                "description": "ERROR: contenido no corresponde al perfil esperado",
+                "urls": [],
+            }
+            if not self._save_worker_row(row):
+                return
+            self.scan_results.append(row)
+            self.scan_worker_states[worker_idx] = {"busy": False, "candidate": None}
+            self._enqueue_scan_log(
+                f"[{len(self.scan_results)}/{self.scan_total_candidates}] Worker {worker_idx + 1} descartado por URL no confiable: {profile_url}"
+            )
+            self._schedule_profile_workers()
+            return
         row = build_profile_row_from_html(
             profile_url=profile_url,
             profile_html=html or "",
-            title_hint=title_hint,
-            description_hint=description_hint,
             status_code=0 if "/i/flow/login" in page_url else 200,
         )
+        title_text = str(row.get("title", "")).strip()
+        description_text = str(row.get("description", "")).strip()
+        if not title_text and not description_text:
+            if retries_left > 0:
+                self._enqueue_scan_log(
+                    f"Worker {worker_idx + 1}: title/description vacios, reintentando..."
+                )
+                self.scan_tab.worker_views[worker_idx].reload()
+                QTimer.singleShot(
+                    700,
+                    lambda: self._collect_worker_data(worker_idx, retries_left - 1),
+                )
+                return
+            row["status_code"] = 0
+            row["title"] = expected_handle
+            row["description"] = "ERROR: title y description vacios tras reintentos"
         detected_handle = str(row.get("detected_handle", "")).strip().lower()
         url_mismatch = (
             page_url
@@ -621,30 +693,12 @@ class BrowserWindow(QMainWindow):
         row.pop("detected_handle", None)
         if row["status_code"] == 0 and not str(row.get("description", "")).strip():
             row["description"] = "ERROR: redireccionado a login wall"
-        if str(row.get("title", "")).strip().startswith(("http://", "https://")):
-            row["title"] = title_hint or expected_handle
-        expected_name = str(candidate.get("following_name", "")).strip()
-        detected_name = str(row.get("title", "")).strip()
-        if (
-            expected_name
-            and self._normalize_profile_name(expected_name) != self._normalize_profile_name(detected_name)
-        ):
-            if retries_left > 0:
-                self._enqueue_scan_log(
-                    f"Worker {worker_idx + 1}: nombre distinto (following vs perfil), refrescando..."
-                )
-                self.scan_tab.worker_views[worker_idx].setUrl(QUrl(profile_url))
-                self._arm_worker_timeout(worker_idx, profile_url)
-                return
-            row["status_code"] = 0
-            row["title"] = expected_name
-            row["description"] = (
-                "ERROR: nombre de following no coincide con nombre detectado en perfil"
-            )
-        row["urls"] = self._resolve_row_urls_with_worker(
-            worker_idx,
-            row.get("urls", []),
-        )
+        self._start_resolving_row_urls_with_worker(worker_idx, row)
+        return
+
+    def _finish_worker_row(self, worker_idx: int, row: dict[str, str | int | list[str]]) -> None:
+        profile_url = str(row.get("url", "")).strip()
+        self._enqueue_related_profiles(row)
         if not self._save_worker_row(row):
             return
         self.scan_results.append(row)
@@ -654,37 +708,13 @@ class BrowserWindow(QMainWindow):
         )
         self._schedule_profile_workers()
 
-    def _arm_worker_timeout(self, worker_idx: int, expected_url: str) -> None:
-        QTimer.singleShot(
-            20000,
-            lambda: self._on_worker_timeout(worker_idx, expected_url),
-        )
-
-    def _on_worker_timeout(self, worker_idx: int, expected_url: str) -> None:
-        if not self.scan_running or self.scan_tab is None:
-            return
-        state = self.scan_worker_states[worker_idx]
-        if not state or not state.get("busy"):
-            return
-        candidate = state.get("candidate")
-        if not isinstance(candidate, dict):
-            return
-        current_expected = str(candidate.get("url", ""))
-        if current_expected != expected_url:
-            return
-        self._enqueue_scan_log(
-            f"Worker {worker_idx + 1}: timeout en {expected_url}, recargando..."
-        )
-        self.scan_tab.worker_views[worker_idx].reload()
-        self._arm_worker_timeout(worker_idx, expected_url)
-
     def _finalize_scan_results(self) -> None:
         if not self.scan_running:
             return
         self._on_scan_finished(
             {
                 "profiles_found": self.scan_saved_count,
-                "db": str(SCAN_DB_FILE),
+                "db": self._scan_db_label(),
             }
         )
 
@@ -696,7 +726,7 @@ class BrowserWindow(QMainWindow):
             self._enqueue_scan_log(
                 f"Escaneo finalizado. Perfiles: {result.get('profiles_found', 0)}"
             )
-            self._enqueue_scan_log(f"SQLite: {result.get('db', '')}")
+            self._enqueue_scan_log(f"MySQL: {result.get('db', '')}")
         self.statusBar().showMessage("Escaneo finalizado", 5000)
         if self.scan_settings_tab is not None:
             self.scan_settings_tab.set_scan_running(False)
@@ -715,16 +745,54 @@ class BrowserWindow(QMainWindow):
         if self.scan_tab is not None:
             self.scan_tab.log_output.append(message)
 
-    def _normalize_profile_name(self, value: str) -> str:
-        normalized = re.sub(r"\s+", " ", value).strip().lower()
-        if normalized.startswith("@"):
-            normalized = normalized[1:]
-        return normalized
+    def _is_x_profile_host(self, page_url: str) -> bool:
+        if not page_url:
+            return False
+        qurl = QUrl(page_url)
+        host = qurl.host().strip().lower()
+        return host in {"x.com", "www.x.com", "mobile.x.com"}
+
+    def _is_web_url(self, raw_url: str) -> bool:
+        qurl = QUrl(raw_url.strip())
+        return qurl.scheme().strip().lower() in {"http", "https"}
+
+    def _sanitize_web_url(self, raw_url: str) -> str:
+        value = str(raw_url).strip()
+        value = re.sub(r"^(https?://)\s+", r"\1", value, flags=re.IGNORECASE)
+        return value
+
+    def _is_tco_url(self, raw_url: str) -> bool:
+        qurl = QUrl(raw_url.strip())
+        host = qurl.host().strip().lower()
+        return host == "t.co"
+
+    def _can_expand_resolved_page_links(self, raw_url: str) -> bool:
+        qurl = QUrl(str(raw_url).strip())
+        host = qurl.host().strip().lower()
+        return any(host == allowed or host.endswith(f".{allowed}") for allowed in self.LINK_EXPANSION_HOSTS)
+
+    def _should_skip_qwebengine_resolution(self, raw_url: str) -> bool:
+        qurl = QUrl(str(raw_url).strip())
+        host = qurl.host().strip().lower()
+        return any(host == blocked or host.endswith(f".{blocked}") for blocked in self.LINK_NO_OPEN_HOSTS)
+
+    def _scan_db_config(self) -> dict[str, object]:
+        return {
+            "host": str(BrowserWindow.app_settings.get("mysql_host", "127.0.0.1")).strip() or "127.0.0.1",
+            "port": self._scan_setting_int("mysql_port", 3306, minimum=1),
+            "database": str(BrowserWindow.app_settings.get("mysql_database", "artbrowser")).strip() or "artbrowser",
+            "user": str(BrowserWindow.app_settings.get("mysql_user", "root")).strip() or "root",
+            "password": str(BrowserWindow.app_settings.get("mysql_password", "")),
+        }
+
+    def _scan_db_label(self) -> str:
+        config = self._scan_db_config()
+        return f"{config['host']}:{config['port']}/{config['database']}.{SCAN_DB_TABLE}"
 
     def _save_worker_row(self, row: dict[str, str | int | list[str]]) -> bool:
         try:
             saved = save_scan_results(
-                db_path=str(SCAN_DB_FILE),
+                db_config=self._scan_db_config(),
                 rows=[row],
             )
             self.scan_saved_count += saved
@@ -733,7 +801,10 @@ class BrowserWindow(QMainWindow):
             self._on_scan_failed(f"Error guardando resultado de worker: {exc}")
             return False
 
-    def _resolve_row_urls_with_worker(self, worker_idx: int, raw_urls: object) -> list[str]:
+    def _start_resolving_row_urls_with_worker(
+        self, worker_idx: int, row: dict[str, str | int | list[str]]
+    ) -> None:
+        raw_urls = row.get("urls", [])
         urls: list[str] = []
         seen: set[str] = set()
         if isinstance(raw_urls, list):
@@ -744,83 +815,254 @@ class BrowserWindow(QMainWindow):
                 seen.add(url)
                 urls.append(url)
         if not urls:
-            return []
-        if not self._scan_setting_bool("scan_resolve_tco", SCAN_RESOLVE_TCO):
-            return urls
+            row["urls"] = []
+            self._finish_worker_row(worker_idx, row)
+            return
 
-        timeout_ms = int(
-            self._scan_setting_float(
-                "scan_url_resolve_timeout_s",
-                SCAN_URL_RESOLVE_TIMEOUT_S,
-                minimum=1.0,
-                maximum=20.0,
-            )
-            * 1000
-        )
-        resolved_urls: list[str] = []
-        resolved_seen: set[str] = set()
-        for original in urls:
-            final_url = original
-            if is_tco_url(original):
-                if original in self.scan_url_resolve_cache:
-                    final_url = self.scan_url_resolve_cache[original]
-                else:
-                    final_url = self._resolve_single_tco_with_worker(
-                        worker_idx, original, timeout_ms
-                    )
-                    self.scan_url_resolve_cache[original] = final_url
-            if final_url in resolved_seen:
-                continue
-            resolved_seen.add(final_url)
-            resolved_urls.append(final_url)
-        return resolved_urls
-
-    def _resolve_single_tco_with_worker(
-        self, worker_idx: int, tco_url: str, timeout_ms: int
-    ) -> str:
-        if self.scan_tab is None:
-            return tco_url
+        current_profile = ""
         state = self.scan_worker_states[worker_idx]
-        if not state:
-            return tco_url
-        state["phase"] = "resolving_links"
+        if isinstance(state, dict):
+            candidate = state.get("candidate")
+            if isinstance(candidate, dict):
+                current_profile = str(candidate.get("url", "")).strip()
+
+            state["phase"] = "resolving_links"
+            state["resolving_row"] = row
+            state["resolve_pending"] = list(urls)
+            state["resolve_urls"] = []
+            state["resolve_seen"] = set()
+            state["resolve_expansion_count"] = 0
+            state["resolve_max_expansion"] = 40
+            state["resolve_current_profile"] = current_profile
+        self._resolve_next_worker_url(worker_idx)
+
+    def _resolve_next_worker_url(self, worker_idx: int) -> None:
+        if not self.scan_running or self.scan_tab is None:
+            return
+        state = self.scan_worker_states[worker_idx]
+        if not isinstance(state, dict):
+            return
+        pending = state.get("resolve_pending")
+        resolved_urls = state.get("resolve_urls")
+        resolved_seen = state.get("resolve_seen")
+        row = state.get("resolving_row")
+        if not isinstance(pending, list) or not isinstance(resolved_urls, list):
+            return
+        if not isinstance(resolved_seen, set) or not isinstance(row, dict):
+            return
+
+        expansion_count = int(state.get("resolve_expansion_count", 0))
+        max_expansion = int(state.get("resolve_max_expansion", 40))
+        while pending and expansion_count < max_expansion:
+            original = self._sanitize_web_url(str(pending.pop(0)).strip())
+            if not original:
+                continue
+            if original not in resolved_seen:
+                resolved_seen.add(original)
+                resolved_urls.append(original)
+            if not self._is_web_url(original):
+                continue
+            if self._should_skip_qwebengine_resolution(original):
+                continue
+            current_profile = str(state.get("resolve_current_profile", "")).strip()
+            self._enqueue_scan_log(
+                f"Worker {worker_idx + 1} [{current_profile}]: resolviendo enlace {original}"
+            )
+            self._open_worker_url_for_resolution(worker_idx, original)
+            return
+
+        row["urls"] = resolved_urls
+        for key in (
+            "resolving_row",
+            "resolve_pending",
+            "resolve_urls",
+            "resolve_seen",
+            "resolve_expansion_count",
+            "resolve_max_expansion",
+            "resolve_current_profile",
+            "resolve_original",
+            "resolve_final_url",
+            "resolve_loaded_ok",
+            "resolve_deadline",
+            "resolve_last_url",
+            "resolve_last_logged_url",
+            "resolve_stable_ms",
+        ):
+            state.pop(key, None)
+        state["phase"] = "loading_profile"
+        self._finish_worker_row(worker_idx, row)
+
+    def _open_worker_url_for_resolution(self, worker_idx: int, target_url: str) -> None:
+        if self.scan_tab is None:
+            return
+        state = self.scan_worker_states[worker_idx]
+        if not isinstance(state, dict):
+            return
+        final_url = self._sanitize_web_url(target_url)
+        state["resolve_original"] = final_url
+        state["resolve_final_url"] = final_url
+        state["resolve_loaded_ok"] = False
+        state["resolve_deadline"] = time.monotonic() + (self.LINK_LOAD_WATCHDOG_MS / 1000.0)
+        state["resolve_last_url"] = ""
+        state["resolve_last_logged_url"] = ""
+        state["resolve_stable_ms"] = 0
         view = self.scan_tab.worker_views[worker_idx]
-        event_loop = QEventLoop(self)
-        final_url = {"value": tco_url}
+        view.setUrl(QUrl("about:blank"))
+        # self._enqueue_scan_log(f"Worker {worker_idx + 1}: abriendo en UI -> {final_url}")
+        QTimer.singleShot(50, lambda: self._load_worker_resolution_url(worker_idx, final_url))
 
-        def on_load_finished(_ok: bool) -> None:
-            current = view.url().toString().strip()
-            if current:
-                final_url["value"] = current
-            if event_loop.isRunning():
-                event_loop.quit()
+    def _load_worker_resolution_url(self, worker_idx: int, target_url: str) -> None:
+        if not self.scan_running or self.scan_tab is None:
+            return
+        state = self.scan_worker_states[worker_idx]
+        if not isinstance(state, dict) or state.get("phase") != "resolving_links":
+            return
+        self.scan_tab.worker_views[worker_idx].setUrl(QUrl(target_url))
+        QTimer.singleShot(150, lambda: self._poll_worker_resolution_url(worker_idx))
 
-        def on_timeout() -> None:
-            if event_loop.isRunning():
-                event_loop.quit()
+    def _poll_worker_resolution_url(self, worker_idx: int) -> None:
+        if not self.scan_running or self.scan_tab is None:
+            return
+        state = self.scan_worker_states[worker_idx]
+        if not isinstance(state, dict) or state.get("phase") != "resolving_links":
+            return
+        view = self.scan_tab.worker_views[worker_idx]
+        current_url = view.url().toString().strip()
+        last_logged_url = str(state.get("resolve_last_logged_url", ""))
+        if current_url and current_url != last_logged_url:
+            state["resolve_last_logged_url"] = current_url
+            # self._enqueue_scan_log(f"Worker {worker_idx + 1}: navegando -> {current_url}")
 
-        timer = QTimer(self)
-        timer.setSingleShot(True)
-        try:
-            view.loadFinished.connect(on_load_finished)
-            timer.timeout.connect(on_timeout)
-            timer.start(max(1000, timeout_ms))
-            view.setUrl(QUrl(tco_url))
-            event_loop.exec()
-            settle_loop = QEventLoop(self)
-            QTimer.singleShot(200, settle_loop.quit)
-            settle_loop.exec()
-            current_after_settle = view.url().toString().strip()
-            if current_after_settle:
-                final_url["value"] = current_after_settle
-            return str(final_url["value"]).strip() or tco_url
-        finally:
-            timer.stop()
-            try:
-                view.loadFinished.disconnect(on_load_finished)
-            except Exception:
-                pass
-            state["phase"] = "loading_profile"
+        stable_ms = int(state.get("resolve_stable_ms", 0))
+        last_url = str(state.get("resolve_last_url", ""))
+        if current_url == last_url:
+            stable_ms += 150
+        else:
+            stable_ms = 0
+            state["resolve_last_url"] = current_url
+        state["resolve_stable_ms"] = stable_ms
+
+        if not view.page().isLoading() and current_url:
+            state["resolve_loaded_ok"] = True
+            state["resolve_final_url"] = current_url
+            if stable_ms >= self.LINK_STABILIZE_MS:
+                QTimer.singleShot(
+                    self.LINK_VISIBLE_DWELL_MS,
+                    lambda: self._collect_resolved_worker_html(worker_idx),
+                )
+                return
+
+        if time.monotonic() >= float(state.get("resolve_deadline", 0.0)):
+            QTimer.singleShot(
+                self.LINK_VISIBLE_DWELL_MS,
+                lambda: self._collect_resolved_worker_html(worker_idx),
+            )
+            return
+        QTimer.singleShot(150, lambda: self._poll_worker_resolution_url(worker_idx))
+
+    def _collect_resolved_worker_html(self, worker_idx: int) -> None:
+        if not self.scan_running or self.scan_tab is None:
+            return
+        state = self.scan_worker_states[worker_idx]
+        if not isinstance(state, dict) or state.get("phase") != "resolving_links":
+            return
+        page = self.scan_tab.worker_views[worker_idx].page()
+        page.toHtml(lambda html: self._on_resolved_worker_html_ready(worker_idx, html or ""))
+
+    def _on_resolved_worker_html_ready(self, worker_idx: int, html: str) -> None:
+        if not self.scan_running:
+            return
+        state = self.scan_worker_states[worker_idx]
+        if not isinstance(state, dict) or state.get("phase") != "resolving_links":
+            return
+        extracted = extract_urls_from_html_document(html)
+        original = str(state.get("resolve_original", "")).strip()
+        final_url = str(state.get("resolve_final_url", "")).strip() or original
+
+        if self._is_tco_url(final_url):
+            for candidate in extracted:
+                candidate_url = self._sanitize_web_url(str(candidate).strip())
+                if not candidate_url or not self._is_web_url(candidate_url):
+                    continue
+                if self._is_tco_url(candidate_url):
+                    continue
+                final_url = candidate_url
+                self._enqueue_scan_log(
+                    f"Worker {worker_idx + 1}: destino inferido desde HTML t.co -> {final_url}"
+                )
+                break
+
+        if original and not (self._is_tco_url(original) and self._is_tco_url(final_url)):
+            self.scan_url_resolve_cache[original] = final_url
+        if final_url != original:
+            self._enqueue_scan_log(f"Worker {worker_idx + 1}: enlace resuelto -> {final_url}")
+
+        resolved_urls = state.get("resolve_urls")
+        resolved_seen = state.get("resolve_seen")
+        pending = state.get("resolve_pending")
+        can_expand_links = self._can_expand_resolved_page_links(final_url)
+        if isinstance(resolved_urls, list) and isinstance(resolved_seen, set):
+            if final_url and final_url not in resolved_seen:
+                resolved_seen.add(final_url)
+                resolved_urls.append(final_url)
+        if bool(state.get("resolve_loaded_ok")) and can_expand_links and isinstance(pending, list):
+            expansion_count = int(state.get("resolve_expansion_count", 0))
+            max_expansion = int(state.get("resolve_max_expansion", 40))
+            for item in extracted:
+                url_item = self._sanitize_web_url(str(item).strip())
+                if not url_item or not isinstance(resolved_seen, set) or url_item in resolved_seen:
+                    continue
+                pending.append(url_item)
+                expansion_count += 1
+                if expansion_count >= max_expansion:
+                    break
+            state["resolve_expansion_count"] = expansion_count
+        elif bool(state.get("resolve_loaded_ok")) and extracted:
+            # self._enqueue_scan_log(
+            #     f"Worker {worker_idx + 1}: links internos ignorados en dominio no permitido"
+            # )
+            pass
+
+        QTimer.singleShot(0, lambda: self._resolve_next_worker_url(worker_idx))
+
+    def _enqueue_related_profiles(self, row: dict[str, str | int | list[str]]) -> None:
+        if not self.scan_running:
+            return
+        if len(self.scan_results) + len(self.scan_pending_candidates) >= self.scan_max_profiles:
+            return
+
+        candidates: list[str] = []
+        description = str(row.get("description", "")).strip()
+        for handle in extract_handles_from_description(description):
+            candidates.append(f"https://x.com/{handle}")
+
+        urls = row.get("urls", [])
+        if isinstance(urls, list):
+            for item in urls:
+                raw = str(item).strip()
+                if not raw:
+                    continue
+                qurl = QUrl(raw)
+                host = qurl.host().strip().lower()
+                path = qurl.path().strip("/")
+                if host in {"x.com", "www.x.com", "mobile.x.com"} and re.fullmatch(
+                    r"[A-Za-z0-9_]{1,15}", path
+                ):
+                    candidates.append(f"https://x.com/{path}")
+
+        added = 0
+        for raw in candidates:
+            lower = raw.strip().lower()
+            if not lower or lower in self.scan_known_profile_urls:
+                continue
+            if len(self.scan_results) + len(self.scan_pending_candidates) >= self.scan_max_profiles:
+                break
+            self.scan_known_profile_urls.add(lower)
+            self.scan_pending_candidates.append({"url": raw})
+            self.scan_total_candidates += 1
+            added += 1
+        if added > 0:
+            self._enqueue_scan_log(f"Perfiles relacionados encolados: +{added}")
 
     def _save_current_page(self) -> None:
         view = self.current_view()

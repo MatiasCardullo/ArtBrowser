@@ -1,15 +1,15 @@
-"""Profile scanning helpers and SQLite persistence."""
+"""Profile scanning helpers and MySQL persistence."""
 
 import json
 import re
-import sqlite3
 from datetime import datetime
 from html import unescape
-from pathlib import Path
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 from bs4.element import Tag
+
+MYSQL_PROFILE_TABLE = "twitter_profiles"
 
 
 def clean_text(value: str) -> str:
@@ -67,15 +67,15 @@ def extract_title_from_banner(banner: Tag | None, profile_handle: str) -> str:
     if not isinstance(name_node, Tag):
         return profile_handle
 
-    seen: set[str] = set()
-    for text in name_node.stripped_strings:
-        value = clean_text(text)
-        if not value or value in seen:
+    spans = name_node.find_all("span")
+    handle_tag = f"@{profile_handle.lower()}"
+    for span in spans:
+        value = clean_text(span.get_text(" ", strip=True))
+        if not value:
             continue
-        seen.add(value)
+        if value.lower() == handle_tag:
+            continue
         if PROFILE_HANDLE_TAG_RE.fullmatch(value) is not None:
-            continue
-        if len(value) <= 1:
             continue
         return value
     return profile_handle
@@ -106,15 +106,52 @@ def extract_urls_from_banner(banner: Tag | None) -> list[str]:
 
     candidates: list[str] = []
     seen: set[str] = set()
+    def _add_if_supported(raw: str, out: list[str], seen_set: set[str]) -> None:
+        value = str(raw).strip()
+        if not value:
+            return
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http", "https", "mailto"}:
+            return
+        if value in seen_set:
+            return
+        seen_set.add(value)
+        out.append(value)
+
     for root in search_roots:
         for anchor in root.find_all("a", href=True):
             href = unescape(str(anchor.get("href", "")).strip())
-            if not href.startswith(("http://", "https://")):
+            title_attr = unescape(str(anchor.get("title", "")).strip())
+            expanded_attr = unescape(str(anchor.get("data-expanded-url", "")).strip())
+            full_attr = unescape(str(anchor.get("data-full-url", "")).strip())
+            text_value = clean_text(anchor.get_text(" ", strip=True))
+
+            raw_options = [expanded_attr, full_attr, title_attr, href, text_value]
+            normalized_options: list[str] = []
+            for option in raw_options:
+                value = str(option).strip()
+                if value:
+                    normalized_options.append(value)
+
+            if not normalized_options:
                 continue
-            if href in seen:
-                continue
-            seen.add(href)
-            candidates.append(href)
+            # If href is t.co, prefer expanded metadata/text first.
+            if is_tco_url(href):
+                preferred = [u for u in normalized_options if not is_tco_url(u)]
+                if preferred:
+                    normalized_options = preferred + [u for u in normalized_options if is_tco_url(u)]
+
+            for resolved in normalized_options:
+                _add_if_supported(resolved, candidates, seen)
+
+        # Also parse naked URLs in visible text (some profiles don't render external links as anchors).
+        text_blob = clean_text(root.get_text(" ", strip=True))
+        for match in re.findall(r"(https?://[^\s<>\"]+)", text_blob):
+            cleaned = match.rstrip(").,;!?")
+            _add_if_supported(cleaned, candidates, seen)
+        for match in re.findall(r"\b(www\.[^\s<>\"]+)", text_blob):
+            cleaned = ("https://" + match).rstrip(").,;!?")
+            _add_if_supported(cleaned, candidates, seen)
     return candidates
 
 
@@ -149,6 +186,19 @@ def is_tco_url(url: str) -> bool:
     return host == "t.co"
 
 
+def extract_handles_from_description(description: str) -> list[str]:
+    found = re.findall(r"(?:^|\s)@([A-Za-z0-9_]{1,15})(?![A-Za-z0-9_])", description or "")
+    seen: set[str] = set()
+    handles: list[str] = []
+    for handle in found:
+        lower = handle.lower()
+        if lower in seen:
+            continue
+        seen.add(lower)
+        handles.append(handle)
+    return handles
+
+
 def extract_title(html: str, profile_url: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     banner = find_profile_banner(soup)
@@ -165,6 +215,45 @@ def extract_profile_urls(html: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
     banner = find_profile_banner(soup)
     return extract_urls_from_banner(banner)
+
+
+def extract_urls_from_html_document(html: str) -> list[str]:
+    soup = BeautifulSoup(html or "", "html.parser")
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(raw: str) -> None:
+        value = str(raw).strip()
+        if not value:
+            return
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http", "https", "mailto"}:
+            return
+        if value in seen:
+            return
+        seen.add(value)
+        candidates.append(value)
+
+    for anchor in soup.find_all("a", href=True):
+        href = unescape(str(anchor.get("href", "")).strip())
+        if href:
+            _add(href)
+        title_attr = unescape(str(anchor.get("title", "")).strip())
+        if title_attr:
+            _add(title_attr)
+        expanded_attr = unescape(str(anchor.get("data-expanded-url", "")).strip())
+        if expanded_attr:
+            _add(expanded_attr)
+        full_attr = unescape(str(anchor.get("data-full-url", "")).strip())
+        if full_attr:
+            _add(full_attr)
+
+    text_blob = clean_text(soup.get_text(" ", strip=True))
+    for match in re.findall(r"(https?://[^\s<>\"]+)", text_blob):
+        _add(match.rstrip(").,;!?"))
+    for match in re.findall(r"\b(www\.[^\s<>\"]+)", text_blob):
+        _add(("https://" + match).rstrip(").,;!?"))
+    return candidates
 
 
 def extract_profile_candidates(following_url: str, html: str) -> list[dict[str, str]]:
@@ -209,45 +298,6 @@ def extract_profile_candidates(following_url: str, html: str) -> list[dict[str, 
     if timeline is None:
         return []
 
-    ignored_tokens = {
-        "seguir",
-        "siguiendo",
-        "te sigue",
-        "follow",
-        "following",
-        "follows you",
-        "cuenta de comentarios",
-    }
-    ignored_prefixes = (
-        "haz clic para dejar de seguir",
-        "click to unfollow",
-        "unfollow ",
-    )
-
-    def extract_following_name(cell: Tag, handle: str) -> str:
-        handle_lower = handle.lower()
-        handle_tag = f"@{handle_lower}"
-        for anchor in cell.find_all("a", href=True):
-            href = str(anchor.get("href", "")).strip()
-            match = re.fullmatch(r"/([A-Za-z0-9_]{1,15})", href)
-            if not match or match.group(1).lower() != handle_lower:
-                continue
-            unique_texts: list[str] = []
-            for text in anchor.stripped_strings:
-                value = clean_text(text)
-                if value and value not in unique_texts:
-                    unique_texts.append(value)
-            for value in unique_texts:
-                lower = value.lower()
-                if any(lower.startswith(prefix) for prefix in ignored_prefixes):
-                    continue
-                if lower == handle_lower or lower == handle_tag or lower in ignored_tokens:
-                    continue
-                if value.startswith("@"):
-                    continue
-                return value
-        return ""
-
     candidates: list[dict[str, str]] = []
     seen: set[str] = set()
 
@@ -267,34 +317,9 @@ def extract_profile_candidates(following_url: str, html: str) -> list[dict[str, 
         if handle is None:
             continue
 
-        unique_texts: list[str] = []
-        for text in cell.stripped_strings:
-            value = clean_text(text)
-            if value and value not in unique_texts:
-                unique_texts.append(value)
-
-        title_hint = ""
-        description_hint = ""
-        handle_lower = handle.lower()
-        handle_tag = f"@{handle_lower}"
-        for value in unique_texts:
-            lower = value.lower()
-            if any(lower.startswith(prefix) for prefix in ignored_prefixes):
-                continue
-            if lower == handle_lower or lower == handle_tag or lower in ignored_tokens:
-                continue
-            if not title_hint and len(value) <= 80 and not value.startswith("@"):
-                title_hint = value
-                continue
-            if len(value) > len(description_hint) and len(value) >= 10:
-                description_hint = value
-
         candidates.append(
             {
                 "url": f"https://x.com/{handle}",
-                "following_name": extract_following_name(cell, handle),
-                "title_hint": title_hint,
-                "description_hint": description_hint,
             }
         )
     return candidates
@@ -323,158 +348,98 @@ def normalize_urls(value: object) -> list[str]:
     return normalized
 
 
-def ensure_scan_db(db_path: str) -> sqlite3.Connection:
-    target = Path(db_path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(target))
-    existing_tables = {
-        str(row[0])
-        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+def _mysql_driver():
+    try:
+        import mysql.connector  # type: ignore[import-not-found]
+
+        return mysql.connector
+    except ImportError:
+        try:
+            import pymysql  # type: ignore[import-not-found]
+
+            return pymysql
+        except ImportError as exc:
+            raise RuntimeError(
+                "MySQL driver missing. Install mysql-connector-python or PyMySQL."
+            ) from exc
+
+
+def _mysql_connection(db_config: dict[str, object], with_database: bool = True):
+    driver = _mysql_driver()
+    database = str(db_config.get("database", "artbrowser")).strip() or "artbrowser"
+    kwargs: dict[str, object] = {
+        "host": str(db_config.get("host", "127.0.0.1")).strip() or "127.0.0.1",
+        "port": int(db_config.get("port", 3306)),
+        "user": str(db_config.get("user", "root")).strip() or "root",
+        "password": str(db_config.get("password", "")),
+        "charset": "utf8mb4",
+        "autocommit": False,
     }
-    if "profiles" in existing_tables:
-        existing_columns = {
-            str(row[1]) for row in conn.execute("PRAGMA table_info(profiles)").fetchall()
-        }
-        if "scan_id" in existing_columns:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS profiles_v2 (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    generated_at TEXT NOT NULL,
-                    profile_url TEXT NOT NULL,
-                    status_code INTEGER NOT NULL,
-                    title TEXT NOT NULL,
-                    description TEXT NOT NULL,
-                    urls TEXT NOT NULL DEFAULT '[]'
-                )
-                """
-            )
-            if "scans" in existing_tables:
-                conn.execute(
-                    """
-                    INSERT INTO profiles_v2 (
-                        generated_at,
-                        profile_url,
-                        status_code,
-                        title,
-                        description,
-                        urls
-                    )
-                    SELECT
-                        COALESCE(scans.generated_at, ''),
-                        profiles.profile_url,
-                        profiles.status_code,
-                        profiles.title,
-                        profiles.description,
-                        COALESCE(profiles.urls, '[]')
-                    FROM profiles
-                    LEFT JOIN scans ON scans.id = profiles.scan_id
-                    """
-                )
-            else:
-                conn.execute(
-                    """
-                    INSERT INTO profiles_v2 (
-                        generated_at,
-                        profile_url,
-                        status_code,
-                        title,
-                        description,
-                        urls
-                    )
-                    SELECT
-                        '',
-                        profile_url,
-                        status_code,
-                        title,
-                        description,
-                        COALESCE(urls, '[]')
-                    FROM profiles
-                    """
-                )
-            conn.execute("DROP TABLE profiles")
-            conn.execute("ALTER TABLE profiles_v2 RENAME TO profiles")
-            existing_tables = {
-                str(row[0])
-                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-            }
-            existing_columns = {
-                str(row[1]) for row in conn.execute("PRAGMA table_info(profiles)").fetchall()
-            }
-        if "following_url" in existing_columns:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS profiles_v3 (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    generated_at TEXT NOT NULL,
-                    profile_url TEXT NOT NULL,
-                    status_code INTEGER NOT NULL,
-                    title TEXT NOT NULL,
-                    description TEXT NOT NULL,
-                    urls TEXT NOT NULL DEFAULT '[]'
-                )
-                """
-            )
-            conn.execute(
-                """
-                INSERT INTO profiles_v3 (
-                    generated_at,
-                    profile_url,
-                    status_code,
-                    title,
-                    description,
-                    urls
-                )
-                SELECT
-                    COALESCE(generated_at, ''),
-                    profile_url,
-                    status_code,
-                    title,
-                    description,
-                    COALESCE(urls, '[]')
-                FROM profiles
-                """
-            )
-            conn.execute("DROP TABLE profiles")
-            conn.execute("ALTER TABLE profiles_v3 RENAME TO profiles")
-    conn.execute(
+    if with_database:
+        kwargs["database"] = database
+    return driver.connect(**kwargs)
+
+
+def _mysql_identifier(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_]+", value):
+        raise ValueError(f"Invalid MySQL identifier: {value}")
+    return f"`{value}`"
+
+
+def ensure_scan_db(db_config: dict[str, object]) -> None:
+    database = str(db_config.get("database", "artbrowser")).strip() or "artbrowser"
+    database_sql = _mysql_identifier(database)
+    table_sql = _mysql_identifier(MYSQL_PROFILE_TABLE)
+    conn = _mysql_connection(db_config, with_database=False)
+    cursor = conn.cursor()
+    cursor.execute(
+        f"CREATE DATABASE IF NOT EXISTS {database_sql} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    conn = _mysql_connection(db_config, with_database=True)
+    cursor = conn.cursor()
+    cursor.execute(
         """
-        CREATE TABLE IF NOT EXISTS profiles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            generated_at TEXT NOT NULL,
-            profile_url TEXT NOT NULL,
-            status_code INTEGER NOT NULL,
+        CREATE TABLE IF NOT EXISTS {table_sql} (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            generated_at DATETIME(6) NOT NULL,
+            profile_url VARCHAR(512) NOT NULL,
+            status_code INT NOT NULL,
             title TEXT NOT NULL,
             description TEXT NOT NULL,
-            urls TEXT NOT NULL DEFAULT '[]'
-        )
-        """
+            urls JSON NOT NULL,
+            artist_category VARCHAR(64) NOT NULL DEFAULT 'general',
+            content_rating VARCHAR(16) NOT NULL DEFAULT 'unknown',
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_twitter_profiles_status_url (status_code, profile_url(191)),
+            INDEX idx_twitter_profiles_category_rating (artist_category, content_rating)
+        ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """.format(table_sql=table_sql)
     )
-    if "scans" in existing_tables:
-        conn.execute("DROP TABLE scans")
-    existing_columns = {
-        str(row[1]) for row in conn.execute("PRAGMA table_info(profiles)").fetchall()
-    }
-    if "generated_at" not in existing_columns:
-        conn.execute("ALTER TABLE profiles ADD COLUMN generated_at TEXT NOT NULL DEFAULT ''")
-    if "urls" not in existing_columns:
-        conn.execute("ALTER TABLE profiles ADD COLUMN urls TEXT NOT NULL DEFAULT '[]'")
     conn.commit()
-    return conn
+    cursor.close()
+    conn.close()
 
 
-def get_success_profile_urls(db_path: str, urls: list[str]) -> set[str]:
+def get_success_profile_urls(db_config: dict[str, object], urls: list[str]) -> set[str]:
     normalized = [str(url).strip().lower() for url in urls if str(url).strip()]
     if not normalized:
         return set()
-    conn = ensure_scan_db(db_path)
-    placeholders = ", ".join("?" for _ in normalized)
+    ensure_scan_db(db_config)
+    conn = _mysql_connection(db_config, with_database=True)
+    cursor = conn.cursor()
+    placeholders = ", ".join("%s" for _ in normalized)
     query = (
         "SELECT LOWER(profile_url) "
-        "FROM profiles "
-        "WHERE status_code = 200 AND LOWER(profile_url) IN ({})".format(placeholders)
+        f"FROM {_mysql_identifier(MYSQL_PROFILE_TABLE)} "
+        f"WHERE status_code = 200 AND LOWER(profile_url) IN ({placeholders})"
     )
-    rows = conn.execute(query, normalized).fetchall()
+    cursor.execute(query, normalized)
+    rows = cursor.fetchall()
+    cursor.close()
     conn.close()
     return {str(row[0]) for row in rows if row and row[0]}
 
@@ -482,19 +447,13 @@ def get_success_profile_urls(db_path: str, urls: list[str]) -> set[str]:
 def build_profile_row_from_html(
     profile_url: str,
     profile_html: str,
-    title_hint: str = "",
-    description_hint: str = "",
     status_code: int = 200,
 ) -> dict[str, str | int | list[str]]:
     profile_handle = profile_handle_from_url(profile_url)
     soup = BeautifulSoup(profile_html, "html.parser")
     banner = find_profile_banner(soup)
     title = extract_title_from_banner(banner, profile_handle)
-    if title == profile_handle and title_hint:
-        title = title_hint
     description = extract_description_from_banner(banner)
-    if not description and description_hint:
-        description = description_hint
     urls = extract_urls_from_banner(banner)
     return {
         "url": profile_url,
@@ -507,25 +466,30 @@ def build_profile_row_from_html(
 
 
 def save_scan_results(
-    db_path: str,
+    db_config: dict[str, object],
     rows: list[dict[str, str | int | list[str]]],
 ) -> int:
     profile_count = len(rows)
     if profile_count == 0:
         return 0
-    conn = ensure_scan_db(db_path)
-    generated_at = datetime.now().isoformat()
-    conn.executemany(
-        """
-        INSERT INTO profiles (
+    ensure_scan_db(db_config)
+    conn = _mysql_connection(db_config, with_database=True)
+    cursor = conn.cursor()
+    generated_at = datetime.now()
+    table_sql = _mysql_identifier(MYSQL_PROFILE_TABLE)
+    cursor.executemany(
+        f"""
+        INSERT INTO {table_sql} (
             generated_at,
             profile_url,
             status_code,
             title,
             description,
-            urls
+            urls,
+            artist_category,
+            content_rating
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """,
         [
             (
@@ -535,10 +499,13 @@ def save_scan_results(
                 str(item["title"]),
                 str(item["description"]),
                 json.dumps(normalize_urls(item.get("urls", [])), ensure_ascii=False),
+                str(item.get("artist_category", "general") or "general"),
+                str(item.get("content_rating", "unknown") or "unknown"),
             )
             for item in rows
         ],
     )
     conn.commit()
+    cursor.close()
     conn.close()
     return profile_count

@@ -30,12 +30,6 @@ class SettingsTab(QWidget):
             except (TypeError, ValueError):
                 return default
 
-        def as_float(value: object, default: float) -> float:
-            try:
-                return float(value)  # type: ignore[arg-type]
-            except (TypeError, ValueError):
-                return default
-
         layout = QVBoxLayout()
         self.setLayout(layout)
 
@@ -70,6 +64,12 @@ class SettingsTab(QWidget):
         )
         form.addRow("Max perfiles:", self.max_profiles_input)
 
+        self.parallel_workers_input = QLineEdit()
+        self.parallel_workers_input.setText(
+            str(as_int(initial_settings.get("scan_parallel_requests", 4), 4))
+        )
+        form.addRow("Workers paralelos (2 o 4):", self.parallel_workers_input)
+
         self.resolve_tco_checkbox = QCheckBox("Resolver enlaces t.co")
         self.resolve_tco_checkbox.setChecked(bool(initial_settings.get("scan_resolve_tco", True)))
         form.addRow("Resolucion links:", self.resolve_tco_checkbox)
@@ -80,11 +80,27 @@ class SettingsTab(QWidget):
         )
         form.addRow("Reusar resultados:", self.skip_already_ok_checkbox)
 
-        self.resolve_timeout_input = QLineEdit()
-        self.resolve_timeout_input.setText(
-            str(as_float(initial_settings.get("scan_url_resolve_timeout_s", 6), 6.0))
-        )
-        form.addRow("Timeout t.co (1-20s):", self.resolve_timeout_input)
+        self.mysql_host_input = QLineEdit()
+        self.mysql_host_input.setText(str(initial_settings.get("mysql_host", "127.0.0.1")))
+        form.addRow("MySQL host:", self.mysql_host_input)
+
+        self.mysql_port_input = QLineEdit()
+        self.mysql_port_input.setText(str(as_int(initial_settings.get("mysql_port", 3306), 3306)))
+        form.addRow("MySQL port:", self.mysql_port_input)
+
+        self.mysql_database_input = QLineEdit()
+        self.mysql_database_input.setText(str(initial_settings.get("mysql_database", "artbrowser")))
+        form.addRow("MySQL database:", self.mysql_database_input)
+
+        self.mysql_user_input = QLineEdit()
+        self.mysql_user_input.setText(str(initial_settings.get("mysql_user", "root")))
+        form.addRow("MySQL user:", self.mysql_user_input)
+
+        self.mysql_password_input = QLineEdit()
+        self.mysql_password_input.setText(str(initial_settings.get("mysql_password", "")))
+        self.mysql_password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addRow("MySQL password:", self.mysql_password_input)
+
         layout.addLayout(form)
 
         save_button = QPushButton("Guardar configuracion")
@@ -117,7 +133,8 @@ class SettingsTab(QWidget):
         try:
             max_scroll_rounds = int(self.max_scroll_rounds_input.text().strip())
             max_profiles = int(self.max_profiles_input.text().strip())
-            resolve_timeout = float(self.resolve_timeout_input.text().strip())
+            parallel_workers = int(self.parallel_workers_input.text().strip())
+            mysql_port = int(self.mysql_port_input.text().strip())
         except ValueError:
             self.status_label.setText("Valores invalidos: revisa los numeros")
             return None
@@ -125,17 +142,24 @@ class SettingsTab(QWidget):
         if max_scroll_rounds <= 0 or max_profiles <= 0:
             self.status_label.setText("Max scroll/perfiles deben ser > 0")
             return None
-        if resolve_timeout < 1 or resolve_timeout > 20:
-            self.status_label.setText("Timeout t.co debe estar entre 1 y 20 segundos")
+        if parallel_workers not in {2, 4}:
+            self.status_label.setText("Workers paralelos debe ser 2 o 4")
             return None
-
+        if mysql_port <= 0:
+            self.status_label.setText("MySQL port debe ser > 0")
+            return None
         return {
             "following_scan_url": url or DEFAULT_FOLLOWING_SCAN_URL,
             "scan_following_max_scroll_rounds": max_scroll_rounds,
             "scan_following_max_profiles": max_profiles,
+            "scan_parallel_requests": parallel_workers,
             "scan_resolve_tco": self.resolve_tco_checkbox.isChecked(),
-            "scan_url_resolve_timeout_s": resolve_timeout,
             "scan_skip_already_ok": self.skip_already_ok_checkbox.isChecked(),
+            "mysql_host": self.mysql_host_input.text().strip() or "127.0.0.1",
+            "mysql_port": mysql_port,
+            "mysql_database": self.mysql_database_input.text().strip() or "artbrowser",
+            "mysql_user": self.mysql_user_input.text().strip() or "root",
+            "mysql_password": self.mysql_password_input.text(),
         }
 
 
@@ -202,3 +226,8 @@ class ScanTab(QWidget):
     def clear_workers(self) -> None:
         for view in self.worker_views:
             view.setUrl(QUrl("about:blank"))
+
+    def set_active_workers(self, count: int) -> None:
+        active = 4 if count >= 4 else 2
+        for idx, view in enumerate(self.worker_views):
+            view.setVisible(idx < active)
