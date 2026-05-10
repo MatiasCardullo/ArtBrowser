@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
 )
 
 from config import (
-    BASE_DIR, DEFAULT_URL, SCAN_DB_TABLE,
+    BASE_DIR, DEFAULT_URL, SCAN_DB_TABLE, SCAN_LOG_FILE,
     SCAN_FOLLOWING_MAX_PROFILES,
     SCAN_FOLLOWING_MAX_SCROLL_ROUNDS,
     SCAN_SKIP_ALREADY_OK,
@@ -20,7 +20,9 @@ from config import (
 )
 from scanner import (
     build_profile_row_from_html,
+    ensure_scan_db,
     extract_handles_from_description,
+    extract_link_page_content,
     extract_profile_candidates,
     extract_urls_from_html_document,
     get_success_profile_urls,
@@ -38,6 +40,8 @@ class BrowserWindow(QMainWindow):
     LINK_LOAD_WATCHDOG_MS = 45000
     LINK_EXPANSION_HOSTS = {"carrd.co", "crd.co", "linktr.ee", "potofu.me"}
     LINK_NO_OPEN_HOSTS = {"discord.gg"}
+    LINK_ABOUT_HOSTS = {"kick.com", "patreon.com", "twitch.tv"}
+    LINK_CONTENT_HOSTS = {"buymeacoffee.com", "ko-fi.com"}
 
     def __init__(self, initial_urls: list[str] | None = None) -> None:
         super().__init__()
@@ -56,6 +60,7 @@ class BrowserWindow(QMainWindow):
         self.scan_total_candidates = 0
         self.scan_worker_states: list[dict[str, object] | None] = [None, None, None, None]
         self.scan_url_resolve_cache: dict[str, str] = {}
+        self.scan_opened_link_urls: set[str] = set()
 
         BrowserWindow.open_windows.append(self)
         self._create_toolbar()
@@ -224,7 +229,6 @@ class BrowserWindow(QMainWindow):
             "scan_parallel_requests",
             "scan_following_max_scroll_rounds",
             "scan_following_max_profiles",
-            "scan_resolve_tco",
             "scan_skip_already_ok",
             "mysql_host",
             "mysql_port",
@@ -267,6 +271,12 @@ class BrowserWindow(QMainWindow):
         self.scan_total_candidates = 0
         self.scan_worker_states = [None, None, None, None]
         self.scan_url_resolve_cache = {}
+        self.scan_opened_link_urls = set()
+        try:
+            ensure_scan_db(self._scan_db_config())
+        except Exception as exc:
+            self._on_scan_failed(f"Error inicializando MySQL: {exc}")
+            return
         self._enqueue_scan_log(f"Cargando pagina de followings: {scan_url}")
         web_view = scan_tab.web_view
         web_view.setUrl(QUrl(scan_url))
@@ -305,7 +315,11 @@ class BrowserWindow(QMainWindow):
                     for item in self.scan_pending_candidates
                     if str(item.get("url", "")).strip()
                 ]
-                existing_urls = get_success_profile_urls(self._scan_db_config(), candidate_urls)
+                try:
+                    existing_urls = get_success_profile_urls(self._scan_db_config(), candidate_urls)
+                except Exception as exc:
+                    self._on_scan_failed(f"Error consultando MySQL: {exc}")
+                    return
                 if existing_urls:
                     before_count = len(self.scan_pending_candidates)
                     self.scan_pending_candidates = [
@@ -698,6 +712,7 @@ class BrowserWindow(QMainWindow):
 
     def _finish_worker_row(self, worker_idx: int, row: dict[str, str | int | list[str]]) -> None:
         profile_url = str(row.get("url", "")).strip()
+        self._classify_profile_row(row)
         self._enqueue_related_profiles(row)
         if not self._save_worker_row(row):
             return
@@ -742,6 +757,12 @@ class BrowserWindow(QMainWindow):
             self.scan_settings_tab.set_scan_running(False)
 
     def _enqueue_scan_log(self, message: str) -> None:
+        line = f"{datetime.now().isoformat(timespec='seconds')} {message}"
+        try:
+            with SCAN_LOG_FILE.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError:
+            pass
         if self.scan_tab is not None:
             self.scan_tab.log_output.append(message)
 
@@ -766,15 +787,73 @@ class BrowserWindow(QMainWindow):
         host = qurl.host().strip().lower()
         return host == "t.co"
 
-    def _can_expand_resolved_page_links(self, raw_url: str) -> bool:
+    def _host_matches(self, raw_url: str, hosts: set[str]) -> bool:
         qurl = QUrl(str(raw_url).strip())
         host = qurl.host().strip().lower()
-        return any(host == allowed or host.endswith(f".{allowed}") for allowed in self.LINK_EXPANSION_HOSTS)
+        return any(host == allowed or host.endswith(f".{allowed}") for allowed in hosts)
+
+    def _can_expand_resolved_page_links(self, raw_url: str) -> bool:
+        return self._host_matches(raw_url, self.LINK_EXPANSION_HOSTS)
 
     def _should_skip_qwebengine_resolution(self, raw_url: str) -> bool:
+        return self._host_matches(raw_url, self.LINK_NO_OPEN_HOSTS)
+
+    def _should_open_url_in_worker(self, raw_url: str) -> bool:
+        return (
+            self._is_tco_url(raw_url)
+            or self._can_expand_resolved_page_links(raw_url)
+            or self._host_matches(raw_url, self.LINK_ABOUT_HOSTS)
+            or self._host_matches(raw_url, self.LINK_CONTENT_HOSTS)
+        )
+
+    def _normalize_profile_link_url(self, raw_url: str) -> str:
+        value = self._sanitize_web_url(raw_url)
+        if not value:
+            return ""
+        if self._host_matches(value, self.LINK_ABOUT_HOSTS):
+            qurl = QUrl(value)
+            path = qurl.path().rstrip("/")
+            if path.endswith("/about"):
+                qurl.setPath(path[:-6] or "/")
+                value = qurl.toString()
+        return value
+
+    def _url_to_open_in_worker(self, raw_url: str) -> str:
+        value = self._sanitize_web_url(raw_url)
+        if not value or not self._host_matches(value, self.LINK_ABOUT_HOSTS):
+            return value
+        qurl = QUrl(value)
+        path = qurl.path().rstrip("/")
+        if not path.endswith("/about"):
+            qurl.setPath(f"{path}/about" if path else "/about")
+        return qurl.toString()
+
+    def _is_ignored_linktree_url(self, raw_url: str, source_url: str = "") -> bool:
+        value = str(raw_url).strip().lower()
+        if not value:
+            return False
+        if self._host_matches(source_url, {"linktr.ee"}):
+            return "linktree" in value or "linktr.ee" in value
         qurl = QUrl(str(raw_url).strip())
-        host = qurl.host().strip().lower()
-        return any(host == blocked or host.endswith(f".{blocked}") for blocked in self.LINK_NO_OPEN_HOSTS)
+        return self._host_matches(qurl.toString(), {"linktr.ee"}) and "utm_" in qurl.query().lower()
+
+    def _classify_profile_row(self, row: dict[str, str | int | list[str]]) -> None:
+        title = str(row.get("title", ""))
+        description = str(row.get("description", ""))
+        urls = row.get("urls", [])
+        url_blob = " ".join(str(item) for item in urls) if isinstance(urls, list) else ""
+        haystack = f"{title} {description} {url_blob}".lower()
+        category = ""
+        has_stream_link = any(token in haystack for token in ("youtube.com", "youtu.be", "twitch.tv", "kick.com"))
+        if "vtuber" in haystack and has_stream_link:
+            category = "vtuber"
+        elif any(token in haystack for token in ("illustrator", "draw", "dibujo", "pixiv", "fanbox.cc")):
+            category = "illustrator"
+        row["artist_category"] = category or "general"
+        if re.search(r"(^|[^a-z0-9])r18([^a-z0-9]|$)", title, re.IGNORECASE) or "+18" in title or "🔞" in title:
+            row["content_rating"] = "nsfw"
+        else:
+            row["content_rating"] = "unknown"
 
     def _scan_db_config(self) -> dict[str, object]:
         return {
@@ -794,6 +873,7 @@ class BrowserWindow(QMainWindow):
             saved = save_scan_results(
                 db_config=self._scan_db_config(),
                 rows=[row],
+                ensure_db=False,
             )
             self.scan_saved_count += saved
             return True
@@ -809,8 +889,10 @@ class BrowserWindow(QMainWindow):
         seen: set[str] = set()
         if isinstance(raw_urls, list):
             for item in raw_urls:
-                url = str(item).strip()
+                url = self._normalize_profile_link_url(str(item).strip())
                 if not url or url in seen:
+                    continue
+                if self._is_ignored_linktree_url(url):
                     continue
                 seen.add(url)
                 urls.append(url)
@@ -830,6 +912,8 @@ class BrowserWindow(QMainWindow):
             state["resolving_row"] = row
             state["resolve_pending"] = list(urls)
             state["resolve_urls"] = []
+            state["resolve_link_details"] = []
+            state["resolve_donation_sites"] = []
             state["resolve_seen"] = set()
             state["resolve_expansion_count"] = 0
             state["resolve_max_expansion"] = 40
@@ -845,25 +929,34 @@ class BrowserWindow(QMainWindow):
         pending = state.get("resolve_pending")
         resolved_urls = state.get("resolve_urls")
         resolved_seen = state.get("resolve_seen")
+        link_details = state.get("resolve_link_details")
+        donation_sites = state.get("resolve_donation_sites")
         row = state.get("resolving_row")
         if not isinstance(pending, list) or not isinstance(resolved_urls, list):
             return
-        if not isinstance(resolved_seen, set) or not isinstance(row, dict):
+        if not isinstance(resolved_seen, set) or not isinstance(link_details, list) or not isinstance(donation_sites, list) or not isinstance(row, dict):
             return
 
         expansion_count = int(state.get("resolve_expansion_count", 0))
         max_expansion = int(state.get("resolve_max_expansion", 40))
         while pending and expansion_count < max_expansion:
-            original = self._sanitize_web_url(str(pending.pop(0)).strip())
+            original = self._normalize_profile_link_url(str(pending.pop(0)).strip())
             if not original:
                 continue
-            if original not in resolved_seen:
+            if self._is_ignored_linktree_url(original):
+                continue
+            if original not in resolved_seen and not self._is_tco_url(original):
                 resolved_seen.add(original)
                 resolved_urls.append(original)
             if not self._is_web_url(original):
                 continue
             if self._should_skip_qwebengine_resolution(original):
                 continue
+            if not self._should_open_url_in_worker(original):
+                continue
+            if original in self.scan_opened_link_urls:
+                continue
+            self.scan_opened_link_urls.add(original)
             current_profile = str(state.get("resolve_current_profile", "")).strip()
             self._enqueue_scan_log(
                 f"Worker {worker_idx + 1} [{current_profile}]: resolviendo enlace {original}"
@@ -872,21 +965,27 @@ class BrowserWindow(QMainWindow):
             return
 
         row["urls"] = resolved_urls
+        row["link_details"] = link_details
+        row["donation_sites"] = donation_sites
         for key in (
             "resolving_row",
             "resolve_pending",
             "resolve_urls",
+            "resolve_link_details",
+            "resolve_donation_sites",
             "resolve_seen",
             "resolve_expansion_count",
             "resolve_max_expansion",
             "resolve_current_profile",
             "resolve_original",
+            "resolve_open_url",
             "resolve_final_url",
             "resolve_loaded_ok",
             "resolve_deadline",
             "resolve_last_url",
             "resolve_last_logged_url",
             "resolve_stable_ms",
+            "resolve_about_redirected",
         ):
             state.pop(key, None)
         state["phase"] = "loading_profile"
@@ -898,8 +997,10 @@ class BrowserWindow(QMainWindow):
         state = self.scan_worker_states[worker_idx]
         if not isinstance(state, dict):
             return
-        final_url = self._sanitize_web_url(target_url)
+        final_url = self._normalize_profile_link_url(target_url)
+        open_url = self._url_to_open_in_worker(final_url)
         state["resolve_original"] = final_url
+        state["resolve_open_url"] = open_url
         state["resolve_final_url"] = final_url
         state["resolve_loaded_ok"] = False
         state["resolve_deadline"] = time.monotonic() + (self.LINK_LOAD_WATCHDOG_MS / 1000.0)
@@ -907,9 +1008,10 @@ class BrowserWindow(QMainWindow):
         state["resolve_last_logged_url"] = ""
         state["resolve_stable_ms"] = 0
         view = self.scan_tab.worker_views[worker_idx]
+        view.stop()
         view.setUrl(QUrl("about:blank"))
         # self._enqueue_scan_log(f"Worker {worker_idx + 1}: abriendo en UI -> {final_url}")
-        QTimer.singleShot(50, lambda: self._load_worker_resolution_url(worker_idx, final_url))
+        QTimer.singleShot(50, lambda: self._load_worker_resolution_url(worker_idx, open_url))
 
     def _load_worker_resolution_url(self, worker_idx: int, target_url: str) -> None:
         if not self.scan_running or self.scan_tab is None:
@@ -943,8 +1045,28 @@ class BrowserWindow(QMainWindow):
         state["resolve_stable_ms"] = stable_ms
 
         if not view.page().isLoading() and current_url:
+            if self._host_matches(current_url, self.LINK_ABOUT_HOSTS):
+                about_url = self._url_to_open_in_worker(current_url)
+                if about_url != current_url and not bool(state.get("resolve_about_redirected")):
+                    state["resolve_about_redirected"] = True
+                    view.setUrl(QUrl(about_url))
+                    QTimer.singleShot(150, lambda: self._poll_worker_resolution_url(worker_idx))
+                    return
             state["resolve_loaded_ok"] = True
             state["resolve_final_url"] = current_url
+            original = str(state.get("resolve_original", "")).strip()
+            if self._is_tco_url(original) and not self._is_tco_url(current_url):
+                if (
+                    not self._can_expand_resolved_page_links(current_url)
+                    and not self._host_matches(current_url, self.LINK_ABOUT_HOSTS)
+                    and not self._host_matches(current_url, self.LINK_CONTENT_HOSTS)
+                ):
+                    view.stop()
+                    QTimer.singleShot(
+                        0,
+                        lambda: self._on_resolved_worker_html_ready(worker_idx, ""),
+                    )
+                    return
             if stable_ms >= self.LINK_STABILIZE_MS:
                 QTimer.singleShot(
                     self.LINK_VISIBLE_DWELL_MS,
@@ -977,14 +1099,16 @@ class BrowserWindow(QMainWindow):
             return
         extracted = extract_urls_from_html_document(html)
         original = str(state.get("resolve_original", "")).strip()
-        final_url = str(state.get("resolve_final_url", "")).strip() or original
+        final_url = self._normalize_profile_link_url(str(state.get("resolve_final_url", "")).strip() or original)
 
         if self._is_tco_url(final_url):
             for candidate in extracted:
-                candidate_url = self._sanitize_web_url(str(candidate).strip())
+                candidate_url = self._normalize_profile_link_url(str(candidate).strip())
                 if not candidate_url or not self._is_web_url(candidate_url):
                     continue
                 if self._is_tco_url(candidate_url):
+                    continue
+                if self._is_ignored_linktree_url(candidate_url):
                     continue
                 final_url = candidate_url
                 self._enqueue_scan_log(
@@ -996,21 +1120,41 @@ class BrowserWindow(QMainWindow):
             self.scan_url_resolve_cache[original] = final_url
         if final_url != original:
             self._enqueue_scan_log(f"Worker {worker_idx + 1}: enlace resuelto -> {final_url}")
+        if final_url:
+            self.scan_opened_link_urls.add(final_url)
 
         resolved_urls = state.get("resolve_urls")
         resolved_seen = state.get("resolve_seen")
+        link_details = state.get("resolve_link_details")
+        donation_sites = state.get("resolve_donation_sites")
         pending = state.get("resolve_pending")
         can_expand_links = self._can_expand_resolved_page_links(final_url)
         if isinstance(resolved_urls, list) and isinstance(resolved_seen, set):
-            if final_url and final_url not in resolved_seen:
+            if final_url and not self._is_tco_url(final_url) and not self._is_ignored_linktree_url(final_url) and final_url not in resolved_seen:
                 resolved_seen.add(final_url)
                 resolved_urls.append(final_url)
+        if isinstance(link_details, list):
+            if self._host_matches(final_url, self.LINK_ABOUT_HOSTS) and html:
+                link_details.append(
+                    {
+                        "url": final_url,
+                        "opened_url": str(state.get("resolve_open_url", "")).strip(),
+                        "kind": "about_html",
+                        "html": html,
+                    }
+                )
+        if isinstance(donation_sites, list):
+            content = extract_link_page_content(final_url, html)
+            if content:
+                donation_sites.append({"url": final_url, "content": content})
         if bool(state.get("resolve_loaded_ok")) and can_expand_links and isinstance(pending, list):
             expansion_count = int(state.get("resolve_expansion_count", 0))
             max_expansion = int(state.get("resolve_max_expansion", 40))
             for item in extracted:
-                url_item = self._sanitize_web_url(str(item).strip())
+                url_item = self._normalize_profile_link_url(str(item).strip())
                 if not url_item or not isinstance(resolved_seen, set) or url_item in resolved_seen:
+                    continue
+                if self._is_tco_url(url_item) or self._is_ignored_linktree_url(url_item, final_url):
                     continue
                 pending.append(url_item)
                 expansion_count += 1

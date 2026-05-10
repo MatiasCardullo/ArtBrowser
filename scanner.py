@@ -10,6 +10,7 @@ from bs4 import BeautifulSoup
 from bs4.element import Tag
 
 MYSQL_PROFILE_TABLE = "twitter_profiles"
+MYSQL_DONATION_TABLE = "donation_sites"
 
 
 def clean_text(value: str) -> str:
@@ -256,6 +257,20 @@ def extract_urls_from_html_document(html: str) -> list[str]:
     return candidates
 
 
+def extract_link_page_content(page_url: str, html: str) -> str:
+    soup = BeautifulSoup(html or "", "html.parser")
+    parsed = urlparse(page_url)
+    host = parsed.netloc.lower().split(":")[0]
+    target = None
+    if host == "buymeacoffee.com" or host.endswith(".buymeacoffee.com"):
+        target = soup.find("div", class_="tw-feature-box")
+    elif host == "ko-fi.com" or host.endswith(".ko-fi.com"):
+        target = soup.find("div", class_="profile-page-tile")
+    if not isinstance(target, Tag):
+        return ""
+    return clean_text(target.get_text(" ", strip=True))
+
+
 def extract_profile_candidates(following_url: str, html: str) -> list[dict[str, str]]:
     blocked = {
         "home",
@@ -350,18 +365,13 @@ def normalize_urls(value: object) -> list[str]:
 
 def _mysql_driver():
     try:
-        import mysql.connector  # type: ignore[import-not-found]
+        import pymysql  # type: ignore[import-not-found]
 
-        return mysql.connector
-    except ImportError:
-        try:
-            import pymysql  # type: ignore[import-not-found]
-
-            return pymysql
-        except ImportError as exc:
-            raise RuntimeError(
-                "MySQL driver missing. Install mysql-connector-python or PyMySQL."
-            ) from exc
+        return pymysql
+    except ImportError as exc:
+        raise RuntimeError(
+            "PyMySQL is required. Install it with: python -m pip install PyMySQL"
+        ) from exc
 
 
 def _mysql_connection(db_config: dict[str, object], with_database: bool = True):
@@ -390,6 +400,7 @@ def ensure_scan_db(db_config: dict[str, object]) -> None:
     database = str(db_config.get("database", "artbrowser")).strip() or "artbrowser"
     database_sql = _mysql_identifier(database)
     table_sql = _mysql_identifier(MYSQL_PROFILE_TABLE)
+    donation_table_sql = _mysql_identifier(MYSQL_DONATION_TABLE)
     conn = _mysql_connection(db_config, with_database=False)
     cursor = conn.cursor()
     cursor.execute(
@@ -411,6 +422,7 @@ def ensure_scan_db(db_config: dict[str, object]) -> None:
             title TEXT NOT NULL,
             description TEXT NOT NULL,
             urls JSON NOT NULL,
+            link_details JSON NULL,
             artist_category VARCHAR(64) NOT NULL DEFAULT 'general',
             content_rating VARCHAR(16) NOT NULL DEFAULT 'unknown',
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -418,6 +430,43 @@ def ensure_scan_db(db_config: dict[str, object]) -> None:
             INDEX idx_twitter_profiles_category_rating (artist_category, content_rating)
         ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """.format(table_sql=table_sql)
+    )
+    cursor.execute(
+        """
+        SELECT COLUMN_NAME
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = %s
+        """,
+        (MYSQL_PROFILE_TABLE,),
+    )
+    columns = {str(row[0]) for row in cursor.fetchall()}
+    if "link_details" not in columns:
+        cursor.execute(
+            f"ALTER TABLE {table_sql} ADD COLUMN link_details JSON NULL AFTER urls"
+        )
+    if "artist_category" not in columns:
+        cursor.execute(
+            f"ALTER TABLE {table_sql} ADD COLUMN artist_category VARCHAR(64) NOT NULL DEFAULT 'general' AFTER link_details"
+        )
+    if "content_rating" not in columns:
+        cursor.execute(
+            f"ALTER TABLE {table_sql} ADD COLUMN content_rating VARCHAR(16) NOT NULL DEFAULT 'unknown' AFTER artist_category"
+        )
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {donation_table_sql} (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            generated_at DATETIME(6) NOT NULL,
+            profile_url VARCHAR(512) NOT NULL,
+            site_url VARCHAR(512) NOT NULL,
+            host VARCHAR(191) NOT NULL,
+            content MEDIUMTEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_donation_sites_profile (profile_url(191)),
+            INDEX idx_donation_sites_host (host)
+        ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """
     )
     conn.commit()
     cursor.close()
@@ -468,11 +517,13 @@ def build_profile_row_from_html(
 def save_scan_results(
     db_config: dict[str, object],
     rows: list[dict[str, str | int | list[str]]],
+    ensure_db: bool = True,
 ) -> int:
     profile_count = len(rows)
     if profile_count == 0:
         return 0
-    ensure_scan_db(db_config)
+    if ensure_db:
+        ensure_scan_db(db_config)
     conn = _mysql_connection(db_config, with_database=True)
     cursor = conn.cursor()
     generated_at = datetime.now()
@@ -486,10 +537,11 @@ def save_scan_results(
             title,
             description,
             urls,
+            link_details,
             artist_category,
             content_rating
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         [
             (
@@ -499,6 +551,7 @@ def save_scan_results(
                 str(item["title"]),
                 str(item["description"]),
                 json.dumps(normalize_urls(item.get("urls", [])), ensure_ascii=False),
+                json.dumps(item.get("link_details", []), ensure_ascii=False),
                 str(item.get("artist_category", "general") or "general"),
                 str(item.get("content_rating", "unknown") or "unknown"),
             )
@@ -506,6 +559,37 @@ def save_scan_results(
         ],
     )
     conn.commit()
+    donation_rows: list[tuple[object, str, str, str, str]] = []
+    for item in rows:
+        profile_url = str(item["url"])
+        raw_sites = item.get("donation_sites", [])
+        if not isinstance(raw_sites, list):
+            continue
+        for site in raw_sites:
+            if not isinstance(site, dict):
+                continue
+            site_url = str(site.get("url", "")).strip()
+            content = str(site.get("content", "")).strip()
+            if not site_url or not content:
+                continue
+            parsed = urlparse(site_url)
+            host = parsed.netloc.lower().split(":")[0]
+            donation_rows.append((generated_at, profile_url, site_url, host, content))
+    if donation_rows:
+        cursor.executemany(
+            f"""
+            INSERT INTO {_mysql_identifier(MYSQL_DONATION_TABLE)} (
+                generated_at,
+                profile_url,
+                site_url,
+                host,
+                content
+            )
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            donation_rows,
+        )
+        conn.commit()
     cursor.close()
     conn.close()
     return profile_count

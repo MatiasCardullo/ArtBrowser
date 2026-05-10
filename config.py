@@ -15,6 +15,28 @@ SETTINGS_FILE = BASE_DIR / "settings.json"
 PROFILE_DIR = BASE_DIR / "profile_data"
 OLD_PROFILE_DIR = BASE_DIR / "profile_storage"
 SCAN_DB_TABLE = "twitter_profiles"
+SCAN_LOG_FILE = BASE_DIR / "scan_debug.log"
+
+
+def load_dotenv_file(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        value = line.strip()
+        if not value or value.startswith("#") or "=" not in value:
+            continue
+        key, raw = value.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        os.environ[key] = raw.strip().strip('"').strip("'")
+
+
+load_dotenv_file(BASE_DIR / ".env")
 
 DEFAULT_URL = "https://www.google.com"
 POPUP_URL = "about:blank"
@@ -22,13 +44,12 @@ DEFAULT_FOLLOWING_SCAN_URL = "https://x.com/my_profile/following"
 SCAN_MAX_PARALLEL_REQUESTS = 4
 SCAN_FOLLOWING_MAX_SCROLL_ROUNDS = 60
 SCAN_FOLLOWING_MAX_PROFILES = 800
-SCAN_RESOLVE_TCO = True
 SCAN_SKIP_ALREADY_OK = True
-MYSQL_HOST = os.getenv("ARTBROWSER_MYSQL_HOST", "127.0.0.1")
-MYSQL_PORT = int(os.getenv("ARTBROWSER_MYSQL_PORT", "3306"))
-MYSQL_DATABASE = os.getenv("ARTBROWSER_MYSQL_DATABASE", "artbrowser")
-MYSQL_USER = os.getenv("ARTBROWSER_MYSQL_USER", "root")
-MYSQL_PASSWORD = os.getenv("ARTBROWSER_MYSQL_PASSWORD", "")
+MYSQL_HOST = os.getenv("ARTBROWSER_MYSQL_HOST", os.getenv("MYSQL_HOST", "127.0.0.1"))
+MYSQL_PORT = int(os.getenv("ARTBROWSER_MYSQL_PORT", os.getenv("MYSQL_PORT", "3306")))
+MYSQL_DATABASE = os.getenv("ARTBROWSER_MYSQL_DATABASE", os.getenv("MYSQL_DATABASE", "artbrowser"))
+MYSQL_USER = os.getenv("ARTBROWSER_MYSQL_USER", os.getenv("MYSQL_USER", "root"))
+MYSQL_PASSWORD = os.getenv("ARTBROWSER_MYSQL_PASSWORD", os.getenv("MYSQL_PASSWORD", ""))
 
 
 class HasTabUrls(Protocol):
@@ -98,7 +119,6 @@ def default_settings() -> dict[str, str | bool | int | float]:
         "scan_parallel_requests": SCAN_MAX_PARALLEL_REQUESTS,
         "scan_following_max_scroll_rounds": SCAN_FOLLOWING_MAX_SCROLL_ROUNDS,
         "scan_following_max_profiles": SCAN_FOLLOWING_MAX_PROFILES,
-        "scan_resolve_tco": SCAN_RESOLVE_TCO,
         "scan_skip_already_ok": SCAN_SKIP_ALREADY_OK,
         "mysql_host": MYSQL_HOST,
         "mysql_port": MYSQL_PORT,
@@ -116,10 +136,32 @@ def load_settings() -> dict[str, str | bool | int | float]:
         if isinstance(raw, dict):
             merged = default_settings()
             merged.update(raw)
+            apply_mysql_env_overrides(merged)
             return merged
     except (json.JSONDecodeError, OSError):
         pass
     return default_settings()
+
+
+def apply_mysql_env_overrides(settings: dict[str, str | bool | int | float]) -> None:
+    env_to_setting = (
+        (("ARTBROWSER_MYSQL_HOST", "MYSQL_HOST"), "mysql_host"),
+        (("ARTBROWSER_MYSQL_PORT", "MYSQL_PORT"), "mysql_port"),
+        (("ARTBROWSER_MYSQL_DATABASE", "MYSQL_DATABASE"), "mysql_database"),
+        (("ARTBROWSER_MYSQL_USER", "MYSQL_USER"), "mysql_user"),
+        (("ARTBROWSER_MYSQL_PASSWORD", "MYSQL_PASSWORD"), "mysql_password"),
+    )
+    for env_keys, setting_key in env_to_setting:
+        env_value = next((os.environ[key] for key in env_keys if key in os.environ), None)
+        if env_value is None:
+            continue
+        if setting_key == "mysql_port":
+            try:
+                settings[setting_key] = int(env_value)
+            except ValueError:
+                continue
+        else:
+            settings[setting_key] = env_value
 
 
 def save_settings(settings: dict[str, str | bool | int | float]) -> None:

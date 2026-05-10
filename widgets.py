@@ -70,10 +70,6 @@ class SettingsTab(QWidget):
         )
         form.addRow("Workers paralelos (2 o 4):", self.parallel_workers_input)
 
-        self.resolve_tco_checkbox = QCheckBox("Resolver enlaces t.co")
-        self.resolve_tco_checkbox.setChecked(bool(initial_settings.get("scan_resolve_tco", True)))
-        form.addRow("Resolucion links:", self.resolve_tco_checkbox)
-
         self.skip_already_ok_checkbox = QCheckBox("Saltar perfiles ya OK (status 200)")
         self.skip_already_ok_checkbox.setChecked(
             bool(initial_settings.get("scan_skip_already_ok", True))
@@ -153,7 +149,6 @@ class SettingsTab(QWidget):
             "scan_following_max_scroll_rounds": max_scroll_rounds,
             "scan_following_max_profiles": max_profiles,
             "scan_parallel_requests": parallel_workers,
-            "scan_resolve_tco": self.resolve_tco_checkbox.isChecked(),
             "scan_skip_already_ok": self.skip_already_ok_checkbox.isChecked(),
             "mysql_host": self.mysql_host_input.text().strip() or "127.0.0.1",
             "mysql_port": mysql_port,
