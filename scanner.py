@@ -13,6 +13,17 @@ MYSQL_PROFILE_TABLE = "twitter_profiles"
 MYSQL_DONATION_TABLE = "donation_sites"
 
 
+def is_ignored_profile_url(raw_url: str) -> bool:
+    try:
+        parsed = urlparse(str(raw_url).strip())
+    except ValueError:
+        return True
+    host = parsed.netloc.lower().split(":")[0]
+    path = parsed.path.rstrip("/").lower()
+    query = parsed.query.lower()
+    return host in {"carrd.co", "www.carrd.co"} and path == "/build" and query == "ref=auto"
+
+
 def clean_text(value: str) -> str:
     cleaned = unescape(value)
     cleaned = re.sub(r"<[^>]+>", " ", cleaned)
@@ -110,6 +121,8 @@ def extract_urls_from_banner(banner: Tag | None) -> list[str]:
     def _add_if_supported(raw: str, out: list[str], seen_set: set[str]) -> None:
         value = str(raw).strip()
         if not value:
+            return
+        if is_ignored_profile_url(value):
             return
         parsed = urlparse(value)
         if parsed.scheme not in {"http", "https", "mailto"}:
@@ -226,6 +239,8 @@ def extract_urls_from_html_document(html: str) -> list[str]:
     def _add(raw: str) -> None:
         value = str(raw).strip()
         if not value:
+            return
+        if is_ignored_profile_url(value):
             return
         parsed = urlparse(value)
         if parsed.scheme not in {"http", "https", "mailto"}:
@@ -418,15 +433,13 @@ def ensure_scan_db(db_config: dict[str, object]) -> None:
             id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
             generated_at DATETIME(6) NOT NULL,
             profile_url VARCHAR(512) NOT NULL,
-            status_code INT NOT NULL,
             title TEXT NOT NULL,
             description TEXT NOT NULL,
             urls JSON NOT NULL,
-            link_details JSON NULL,
             artist_category VARCHAR(64) NOT NULL DEFAULT 'general',
             content_rating VARCHAR(16) NOT NULL DEFAULT 'unknown',
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            INDEX idx_twitter_profiles_status_url (status_code, profile_url(191)),
+            INDEX idx_twitter_profiles_profile_url (profile_url(191)),
             INDEX idx_twitter_profiles_category_rating (artist_category, content_rating)
         ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """.format(table_sql=table_sql)
@@ -441,13 +454,31 @@ def ensure_scan_db(db_config: dict[str, object]) -> None:
         (MYSQL_PROFILE_TABLE,),
     )
     columns = {str(row[0]) for row in cursor.fetchall()}
-    if "link_details" not in columns:
+    cursor.execute(
+        """
+        SELECT INDEX_NAME
+        FROM INFORMATION_SCHEMA.STATISTICS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = %s
+        """,
+        (MYSQL_PROFILE_TABLE,),
+    )
+    indexes = {str(row[0]) for row in cursor.fetchall()}
+    if "idx_twitter_profiles_status_url" in indexes:
         cursor.execute(
-            f"ALTER TABLE {table_sql} ADD COLUMN link_details JSON NULL AFTER urls"
+            f"ALTER TABLE {table_sql} DROP INDEX idx_twitter_profiles_status_url"
+        )
+    if "status_code" in columns:
+        cursor.execute(f"ALTER TABLE {table_sql} DROP COLUMN status_code")
+    if "link_details" in columns:
+        cursor.execute(f"ALTER TABLE {table_sql} DROP COLUMN link_details")
+    if "idx_twitter_profiles_profile_url" not in indexes:
+        cursor.execute(
+            f"CREATE INDEX idx_twitter_profiles_profile_url ON {table_sql} (profile_url(191))"
         )
     if "artist_category" not in columns:
         cursor.execute(
-            f"ALTER TABLE {table_sql} ADD COLUMN artist_category VARCHAR(64) NOT NULL DEFAULT 'general' AFTER link_details"
+            f"ALTER TABLE {table_sql} ADD COLUMN artist_category VARCHAR(64) NOT NULL DEFAULT 'general' AFTER urls"
         )
     if "content_rating" not in columns:
         cursor.execute(
@@ -484,7 +515,9 @@ def get_success_profile_urls(db_config: dict[str, object], urls: list[str]) -> s
     query = (
         "SELECT LOWER(profile_url) "
         f"FROM {_mysql_identifier(MYSQL_PROFILE_TABLE)} "
-        f"WHERE status_code = 200 AND LOWER(profile_url) IN ({placeholders})"
+        f"WHERE TRIM(description) <> '' "
+        "AND JSON_LENGTH(urls) > 0 "
+        f"AND LOWER(profile_url) IN ({placeholders})"
     )
     cursor.execute(query, normalized)
     rows = cursor.fetchall()
@@ -493,10 +526,56 @@ def get_success_profile_urls(db_config: dict[str, object], urls: list[str]) -> s
     return {str(row[0]) for row in rows if row and row[0]}
 
 
+def get_scan_dashboard_data(db_config: dict[str, object], limit: int = 80) -> dict[str, object]:
+    ensure_scan_db(db_config)
+    conn = _mysql_connection(db_config, with_database=True)
+    cursor = conn.cursor()
+    table_sql = _mysql_identifier(MYSQL_PROFILE_TABLE)
+    cursor.execute(f"SELECT COUNT(*) FROM {table_sql}")
+    total_profiles = int(cursor.fetchone()[0])
+    cursor.execute(
+        f"""
+        SELECT artist_category, COUNT(*)
+        FROM {table_sql}
+        GROUP BY artist_category
+        ORDER BY COUNT(*) DESC, artist_category ASC
+        """
+    )
+    categories = [(str(row[0] or "general"), int(row[1])) for row in cursor.fetchall()]
+    cursor.execute(
+        f"""
+        SELECT profile_url, title, description, urls, artist_category, content_rating, generated_at
+        FROM {table_sql}
+        ORDER BY generated_at DESC, id DESC
+        LIMIT %s
+        """,
+        (max(1, int(limit)),),
+    )
+    rows: list[dict[str, object]] = []
+    for row in cursor.fetchall():
+        rows.append(
+            {
+                "profile_url": str(row[0] or ""),
+                "title": str(row[1] or ""),
+                "description": str(row[2] or ""),
+                "urls": normalize_urls(row[3]),
+                "artist_category": str(row[4] or "general"),
+                "content_rating": str(row[5] or "unknown"),
+                "generated_at": str(row[6] or ""),
+            }
+        )
+    cursor.close()
+    conn.close()
+    return {
+        "total_profiles": total_profiles,
+        "categories": categories,
+        "rows": rows,
+    }
+
+
 def build_profile_row_from_html(
     profile_url: str,
     profile_html: str,
-    status_code: int = 200,
 ) -> dict[str, str | int | list[str]]:
     profile_handle = profile_handle_from_url(profile_url)
     soup = BeautifulSoup(profile_html, "html.parser")
@@ -506,7 +585,6 @@ def build_profile_row_from_html(
     urls = extract_urls_from_banner(banner)
     return {
         "url": profile_url,
-        "status_code": status_code,
         "title": title,
         "description": description,
         "urls": urls,
@@ -533,25 +611,21 @@ def save_scan_results(
         INSERT INTO {table_sql} (
             generated_at,
             profile_url,
-            status_code,
             title,
             description,
             urls,
-            link_details,
             artist_category,
             content_rating
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
         """,
         [
             (
                 generated_at,
                 str(item["url"]),
-                int(item["status_code"]),
                 str(item["title"]),
                 str(item["description"]),
                 json.dumps(normalize_urls(item.get("urls", [])), ensure_ascii=False),
-                json.dumps(item.get("link_details", []), ensure_ascii=False),
                 str(item.get("artist_category", "general") or "general"),
                 str(item.get("content_rating", "unknown") or "unknown"),
             )

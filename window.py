@@ -3,6 +3,7 @@
 import re
 import time
 from datetime import datetime
+from html import escape
 
 from PyQt6.QtCore import QTimer, QUrl
 from PyQt6.QtGui import QAction
@@ -25,7 +26,9 @@ from scanner import (
     extract_link_page_content,
     extract_profile_candidates,
     extract_urls_from_html_document,
+    get_scan_dashboard_data,
     get_success_profile_urls,
+    is_ignored_profile_url,
     save_scan_results,
 )
 from widgets import ScanTab, SettingsTab, WebEngineView
@@ -302,7 +305,7 @@ class BrowserWindow(QMainWindow):
                 return
             # Freeze followings page once candidates are collected; workers no longer need it.
             web_view.stop()
-            web_view.setUrl(QUrl("about:blank"))
+            self._show_scan_dashboard("Recolectando perfiles desde workers...")
             if not collected_candidates:
                 self._on_scan_failed(
                     "No se encontraron perfiles en la pagina. Verifica que el perfil sea visible."
@@ -329,7 +332,7 @@ class BrowserWindow(QMainWindow):
                     ]
                     skipped = before_count - len(self.scan_pending_candidates)
                     self._enqueue_scan_log(
-                        f"Saltados por cache MySQL status=200: {skipped}"
+                        f"Saltados por cache MySQL con descripcion y URLs: {skipped}"
                     )
             self.scan_total_candidates = len(self.scan_pending_candidates)
             self.scan_known_profile_urls = {
@@ -549,22 +552,7 @@ class BrowserWindow(QMainWindow):
             return
         if not ok:
             profile_url = str(candidate.get("url", ""))
-            row = {
-                "url": profile_url,
-                "status_code": 0,
-                "title": profile_url.rsplit("/", 1)[-1],
-                "description": "ERROR: no se pudo cargar perfil en QWebEngine",
-                "urls": [],
-            }
-            if not self._save_worker_row(row):
-                return
-            self.scan_results.append(row)
-            self._enqueue_scan_log(
-                f"[{len(self.scan_results)}/{self.scan_total_candidates}] Worker {worker_idx + 1} finalizado: {profile_url}"
-            )
-            self.scan_worker_states[worker_idx] = {"busy": False, "candidate": None}
-            self._enqueue_scan_log(f"Worker {worker_idx + 1}: fallo de carga")
-            self._schedule_profile_workers()
+            self._skip_worker_profile(worker_idx, profile_url, "fallo de carga")
             return
 
         self._collect_worker_data(worker_idx, retries_left=10)
@@ -581,7 +569,7 @@ class BrowserWindow(QMainWindow):
             const userNameNode = document.querySelector('[data-testid="UserName"]');
             const descNode = document.querySelector('[data-testid="UserDescription"]');
             const headerItemsNode = document.querySelector('[data-testid="UserProfileHeader_Items"]');
-            const ready = Boolean(userNameNode && (descNode || headerItemsNode));
+            const ready = Boolean(userNameNode && descNode);
             return {
                 ready,
                 pageUrl: location.href || '',
@@ -649,33 +637,18 @@ class BrowserWindow(QMainWindow):
                 )
                 self.scan_tab.worker_views[worker_idx].setUrl(QUrl(profile_url))
                 return
-            row = {
-                "url": profile_url,
-                "status_code": 0,
-                "title": expected_handle,
-                "description": "ERROR: contenido no corresponde al perfil esperado",
-                "urls": [],
-            }
-            if not self._save_worker_row(row):
-                return
-            self.scan_results.append(row)
-            self.scan_worker_states[worker_idx] = {"busy": False, "candidate": None}
-            self._enqueue_scan_log(
-                f"[{len(self.scan_results)}/{self.scan_total_candidates}] Worker {worker_idx + 1} descartado por URL no confiable: {profile_url}"
-            )
-            self._schedule_profile_workers()
+            self._skip_worker_profile(worker_idx, profile_url, "URL no confiable")
             return
         row = build_profile_row_from_html(
             profile_url=profile_url,
             profile_html=html or "",
-            status_code=0 if "/i/flow/login" in page_url else 200,
         )
         title_text = str(row.get("title", "")).strip()
         description_text = str(row.get("description", "")).strip()
-        if not title_text and not description_text:
+        if not description_text:
             if retries_left > 0:
                 self._enqueue_scan_log(
-                    f"Worker {worker_idx + 1}: title/description vacios, reintentando..."
+                    f"Worker {worker_idx + 1}: descripcion no cargada, reintentando..."
                 )
                 self.scan_tab.worker_views[worker_idx].reload()
                 QTimer.singleShot(
@@ -683,9 +656,10 @@ class BrowserWindow(QMainWindow):
                     lambda: self._collect_worker_data(worker_idx, retries_left - 1),
                 )
                 return
-            row["status_code"] = 0
+            self._skip_worker_profile(worker_idx, profile_url, "descripcion no cargada")
+            return
+        if not title_text:
             row["title"] = expected_handle
-            row["description"] = "ERROR: title y description vacios tras reintentos"
         detected_handle = str(row.get("detected_handle", "")).strip().lower()
         url_mismatch = (
             page_url
@@ -705,10 +679,25 @@ class BrowserWindow(QMainWindow):
             )
             return
         row.pop("detected_handle", None)
-        if row["status_code"] == 0 and not str(row.get("description", "")).strip():
-            row["description"] = "ERROR: redireccionado a login wall"
         self._start_resolving_row_urls_with_worker(worker_idx, row)
         return
+
+    def _skip_worker_profile(self, worker_idx: int, profile_url: str, reason: str) -> None:
+        if self.scan_tab is None:
+            return
+        self.scan_results.append(
+            {
+                "url": profile_url,
+                "title": profile_url.rsplit("/", 1)[-1],
+                "description": "",
+                "urls": [],
+            }
+        )
+        self.scan_worker_states[worker_idx] = {"busy": False, "candidate": None}
+        self._enqueue_scan_log(
+            f"[{len(self.scan_results)}/{self.scan_total_candidates}] Worker {worker_idx + 1} omitido: {profile_url} ({reason})"
+        )
+        self._schedule_profile_workers()
 
     def _finish_worker_row(self, worker_idx: int, row: dict[str, str | int | list[str]]) -> None:
         profile_url = str(row.get("url", "")).strip()
@@ -720,6 +709,9 @@ class BrowserWindow(QMainWindow):
         self.scan_worker_states[worker_idx] = {"busy": False, "candidate": None}
         self._enqueue_scan_log(
             f"[{len(self.scan_results)}/{self.scan_total_candidates}] Worker {worker_idx + 1} finalizado: {profile_url}"
+        )
+        self._show_scan_dashboard(
+            f"Escaneando... perfiles guardados: {self.scan_saved_count}"
         )
         self._schedule_profile_workers()
 
@@ -738,6 +730,7 @@ class BrowserWindow(QMainWindow):
         self.scan_url_resolve_cache = {}
         if self.scan_tab is not None:
             self.scan_tab.set_running(False)
+            self._show_scan_dashboard("Escaneo finalizado")
             self._enqueue_scan_log(
                 f"Escaneo finalizado. Perfiles: {result.get('profiles_found', 0)}"
             )
@@ -751,6 +744,7 @@ class BrowserWindow(QMainWindow):
         self.scan_url_resolve_cache = {}
         if self.scan_tab is not None:
             self.scan_tab.set_running(False)
+            self._show_scan_dashboard(f"Escaneo fallido: {error}")
             self._enqueue_scan_log(f"ERROR: {error}")
         self.statusBar().showMessage("Escaneo fallido", 5000)
         if self.scan_settings_tab is not None:
@@ -765,6 +759,109 @@ class BrowserWindow(QMainWindow):
             pass
         if self.scan_tab is not None:
             self.scan_tab.log_output.append(message)
+
+    def _show_scan_dashboard(self, status_text: str) -> None:
+        if self.scan_tab is None:
+            return
+        try:
+            data = get_scan_dashboard_data(self._scan_db_config())
+            html = self._build_scan_dashboard_html(status_text, data)
+        except Exception as exc:
+            html = self._build_scan_dashboard_html(
+                status_text,
+                {
+                    "total_profiles": 0,
+                    "categories": [],
+                    "rows": [],
+                    "error": str(exc),
+                },
+            )
+        self.scan_tab.web_view.setHtml(html, QUrl("https://artbrowser.local/scan-dashboard"))
+
+    def _build_scan_dashboard_html(self, status_text: str, data: dict[str, object]) -> str:
+        rows = data.get("rows", [])
+        categories = data.get("categories", [])
+        total = int(data.get("total_profiles", 0) or 0)
+        error = str(data.get("error", "") or "")
+
+        category_html = ""
+        if isinstance(categories, list):
+            for item in categories:
+                if not isinstance(item, tuple) or len(item) != 2:
+                    continue
+                category_html += (
+                    "<span class='pill'>"
+                    f"{escape(str(item[0]))}: {escape(str(item[1]))}"
+                    "</span>"
+                )
+
+        row_html = ""
+        if isinstance(rows, list):
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                raw_urls = item.get("urls", [])
+                urls = raw_urls if isinstance(raw_urls, list) else []
+                urls_html = " ".join(
+                    f"<a href='{escape(str(url), quote=True)}'>{escape(str(url))}</a>"
+                    for url in urls[:4]
+                )
+                profile_url = str(item.get("profile_url", ""))
+                row_html += (
+                    "<tr>"
+                    f"<td><a href='{escape(profile_url, quote=True)}'>{escape(profile_url)}</a></td>"
+                    f"<td>{escape(str(item.get('title', '')))}</td>"
+                    f"<td>{escape(str(item.get('artist_category', 'general')))}</td>"
+                    f"<td>{escape(str(item.get('content_rating', 'unknown')))}</td>"
+                    f"<td>{escape(str(item.get('description', '')))}</td>"
+                    f"<td>{urls_html}</td>"
+                    f"<td>{escape(str(item.get('generated_at', '')))}</td>"
+                    "</tr>"
+                )
+
+        error_html = f"<p class='error'>{escape(error)}</p>" if error else ""
+        if not row_html:
+            row_html = "<tr><td colspan='7'>Sin perfiles guardados todavia.</td></tr>"
+        return f"""
+        <!doctype html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 20px; color: #1f2933; }}
+                h1 {{ font-size: 22px; margin: 0 0 8px; }}
+                .meta {{ margin-bottom: 14px; color: #52606d; }}
+                .pill {{ display: inline-block; padding: 4px 8px; margin: 0 6px 8px 0; background: #e4e7eb; border-radius: 4px; }}
+                .error {{ color: #b42318; }}
+                table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+                th, td {{ border-bottom: 1px solid #d9e2ec; padding: 8px; vertical-align: top; text-align: left; }}
+                th {{ background: #f5f7fa; position: sticky; top: 0; }}
+                a {{ color: #0967d2; word-break: break-all; }}
+                td:nth-child(5) {{ max-width: 420px; }}
+            </style>
+        </head>
+        <body>
+            <h1>ArtBrowser Scan SQL</h1>
+            <div class="meta">{escape(status_text)} | perfiles en tabla: {total}</div>
+            {error_html}
+            <div>{category_html}</div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Perfil</th>
+                        <th>Titulo</th>
+                        <th>Categoria</th>
+                        <th>Rating</th>
+                        <th>Descripcion</th>
+                        <th>URLs</th>
+                        <th>Fecha</th>
+                    </tr>
+                </thead>
+                <tbody>{row_html}</tbody>
+            </table>
+        </body>
+        </html>
+        """
 
     def _is_x_profile_host(self, page_url: str) -> bool:
         if not page_url:
@@ -837,16 +934,21 @@ class BrowserWindow(QMainWindow):
         qurl = QUrl(str(raw_url).strip())
         return self._host_matches(qurl.toString(), {"linktr.ee"}) and "utm_" in qurl.query().lower()
 
+    def _is_ignored_profile_link_url(self, raw_url: str) -> bool:
+        return is_ignored_profile_url(raw_url)
+
     def _classify_profile_row(self, row: dict[str, str | int | list[str]]) -> None:
         title = str(row.get("title", ""))
         description = str(row.get("description", ""))
         urls = row.get("urls", [])
         url_blob = " ".join(str(item) for item in urls) if isinstance(urls, list) else ""
         haystack = f"{title} {description} {url_blob}".lower()
+        description_lower = description.lower()
         category = ""
-        has_stream_link = any(token in haystack for token in ("youtube.com", "youtu.be", "twitch.tv", "kick.com"))
-        if "vtuber" in haystack and has_stream_link:
+        if "vtuber" in description_lower or "ママ" in description or "パパ" in description:
             category = "vtuber"
+        elif any(token in haystack for token in ("twitch.tv", "kick.com")):
+            category = "stream"
         elif any(token in haystack for token in ("illustrator", "draw", "dibujo", "pixiv", "fanbox.cc")):
             category = "illustrator"
         row["artist_category"] = category or "general"
@@ -892,6 +994,8 @@ class BrowserWindow(QMainWindow):
                 url = self._normalize_profile_link_url(str(item).strip())
                 if not url or url in seen:
                     continue
+                if self._is_ignored_profile_link_url(url):
+                    continue
                 if self._is_ignored_linktree_url(url):
                     continue
                 seen.add(url)
@@ -912,7 +1016,6 @@ class BrowserWindow(QMainWindow):
             state["resolving_row"] = row
             state["resolve_pending"] = list(urls)
             state["resolve_urls"] = []
-            state["resolve_link_details"] = []
             state["resolve_donation_sites"] = []
             state["resolve_seen"] = set()
             state["resolve_expansion_count"] = 0
@@ -929,12 +1032,11 @@ class BrowserWindow(QMainWindow):
         pending = state.get("resolve_pending")
         resolved_urls = state.get("resolve_urls")
         resolved_seen = state.get("resolve_seen")
-        link_details = state.get("resolve_link_details")
         donation_sites = state.get("resolve_donation_sites")
         row = state.get("resolving_row")
         if not isinstance(pending, list) or not isinstance(resolved_urls, list):
             return
-        if not isinstance(resolved_seen, set) or not isinstance(link_details, list) or not isinstance(donation_sites, list) or not isinstance(row, dict):
+        if not isinstance(resolved_seen, set) or not isinstance(donation_sites, list) or not isinstance(row, dict):
             return
 
         expansion_count = int(state.get("resolve_expansion_count", 0))
@@ -942,6 +1044,8 @@ class BrowserWindow(QMainWindow):
         while pending and expansion_count < max_expansion:
             original = self._normalize_profile_link_url(str(pending.pop(0)).strip())
             if not original:
+                continue
+            if self._is_ignored_profile_link_url(original):
                 continue
             if self._is_ignored_linktree_url(original):
                 continue
@@ -965,13 +1069,11 @@ class BrowserWindow(QMainWindow):
             return
 
         row["urls"] = resolved_urls
-        row["link_details"] = link_details
         row["donation_sites"] = donation_sites
         for key in (
             "resolving_row",
             "resolve_pending",
             "resolve_urls",
-            "resolve_link_details",
             "resolve_donation_sites",
             "resolve_seen",
             "resolve_expansion_count",
@@ -1106,6 +1208,8 @@ class BrowserWindow(QMainWindow):
                 candidate_url = self._normalize_profile_link_url(str(candidate).strip())
                 if not candidate_url or not self._is_web_url(candidate_url):
                     continue
+                if self._is_ignored_profile_link_url(candidate_url):
+                    continue
                 if self._is_tco_url(candidate_url):
                     continue
                 if self._is_ignored_linktree_url(candidate_url):
@@ -1125,24 +1229,19 @@ class BrowserWindow(QMainWindow):
 
         resolved_urls = state.get("resolve_urls")
         resolved_seen = state.get("resolve_seen")
-        link_details = state.get("resolve_link_details")
         donation_sites = state.get("resolve_donation_sites")
         pending = state.get("resolve_pending")
         can_expand_links = self._can_expand_resolved_page_links(final_url)
         if isinstance(resolved_urls, list) and isinstance(resolved_seen, set):
-            if final_url and not self._is_tco_url(final_url) and not self._is_ignored_linktree_url(final_url) and final_url not in resolved_seen:
+            if (
+                final_url
+                and not self._is_tco_url(final_url)
+                and not self._is_ignored_profile_link_url(final_url)
+                and not self._is_ignored_linktree_url(final_url)
+                and final_url not in resolved_seen
+            ):
                 resolved_seen.add(final_url)
                 resolved_urls.append(final_url)
-        if isinstance(link_details, list):
-            if self._host_matches(final_url, self.LINK_ABOUT_HOSTS) and html:
-                link_details.append(
-                    {
-                        "url": final_url,
-                        "opened_url": str(state.get("resolve_open_url", "")).strip(),
-                        "kind": "about_html",
-                        "html": html,
-                    }
-                )
         if isinstance(donation_sites, list):
             content = extract_link_page_content(final_url, html)
             if content:
@@ -1153,6 +1252,8 @@ class BrowserWindow(QMainWindow):
             for item in extracted:
                 url_item = self._normalize_profile_link_url(str(item).strip())
                 if not url_item or not isinstance(resolved_seen, set) or url_item in resolved_seen:
+                    continue
+                if self._is_ignored_profile_link_url(url_item):
                     continue
                 if self._is_tco_url(url_item) or self._is_ignored_linktree_url(url_item, final_url):
                     continue
