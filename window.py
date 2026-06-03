@@ -1,9 +1,11 @@
 """Main window implementation."""
 
+import json
 import re
 import time
 from datetime import datetime
 from html import escape
+from urllib.parse import urlencode
 
 from PyQt6.QtCore import QTimer, QUrl
 from PyQt6.QtGui import QAction
@@ -21,14 +23,17 @@ from config import (
 )
 from scanner import (
     build_profile_row_from_html,
+    build_profile_row_from_api_json,
     ensure_scan_db,
     extract_handles_from_description,
     extract_link_page_content,
     extract_profile_candidates,
+    extract_vtuber_metadata,
     extract_urls_from_html_document,
     get_scan_dashboard_data,
     get_success_profile_urls,
     is_ignored_profile_url,
+    load_user_by_screen_name_template,
     save_scan_results,
 )
 from widgets import ScanTab, SettingsTab, WebEngineView
@@ -38,6 +43,8 @@ class BrowserWindow(QMainWindow):
     open_windows = []
     profile: QWebEngineProfile | None = None
     app_settings: dict[str, str | bool | int | float] = {}
+    profile_cookies: dict[str, str] = {}
+    cookie_capture_connected = False
     LINK_VISIBLE_DWELL_MS = 8000
     LINK_STABILIZE_MS = 1200
     LINK_LOAD_WATCHDOG_MS = 45000
@@ -45,6 +52,15 @@ class BrowserWindow(QMainWindow):
     LINK_NO_OPEN_HOSTS = {"discord.gg"}
     LINK_ABOUT_HOSTS = {"kick.com", "patreon.com", "twitch.tv"}
     LINK_CONTENT_HOSTS = {"buymeacoffee.com", "ko-fi.com"}
+    RELATED_PROFILE_BLOCKLIST = {
+        "youtube",
+        "youtubegaming",
+        "twitch",
+        "twitchsupport",
+        "x",
+        "twitter",
+        "xsupport",
+    }
 
     def __init__(self, initial_urls: list[str] | None = None) -> None:
         super().__init__()
@@ -64,14 +80,40 @@ class BrowserWindow(QMainWindow):
         self.scan_worker_states: list[dict[str, object] | None] = [None, None, None, None]
         self.scan_url_resolve_cache: dict[str, str] = {}
         self.scan_opened_link_urls: set[str] = set()
+        self.scan_api_template: dict[str, object] | None = None
+        self.scan_api_view: WebEngineView | None = None
+        self.scan_api_ready = False
+        self.scan_api_queue: list[tuple[int, str]] = []
 
         BrowserWindow.open_windows.append(self)
+        self._ensure_cookie_capture()
         self._create_toolbar()
         self._create_tabs()
 
         urls = initial_urls or [DEFAULT_URL]
         for url in urls:
             self.add_tab(url)
+
+    def _ensure_cookie_capture(self) -> None:
+        if BrowserWindow.profile is None or BrowserWindow.cookie_capture_connected:
+            return
+        store = BrowserWindow.profile.cookieStore()
+        store.cookieAdded.connect(self._on_profile_cookie_added)
+        store.loadAllCookies()
+        BrowserWindow.cookie_capture_connected = True
+
+    def _on_profile_cookie_added(self, cookie) -> None:
+        try:
+            name = bytes(cookie.name()).decode("utf-8", errors="ignore")
+            value = bytes(cookie.value()).decode("utf-8", errors="ignore")
+            domain = str(cookie.domain()).lower()
+        except Exception:
+            return
+        if not name or not value:
+            return
+        if domain and "x.com" not in domain and "twitter.com" not in domain:
+            return
+        BrowserWindow.profile_cookies[name] = value
 
     def _create_web_view(self) -> WebEngineView:
         return WebEngineView(self.add_tab, BrowserWindow.profile)
@@ -275,11 +317,15 @@ class BrowserWindow(QMainWindow):
         self.scan_worker_states = [None, None, None, None]
         self.scan_url_resolve_cache = {}
         self.scan_opened_link_urls = set()
+        self.scan_api_ready = False
+        self.scan_api_queue = []
         try:
             ensure_scan_db(self._scan_db_config())
+            self.scan_api_template = load_user_by_screen_name_template(BASE_DIR)
         except Exception as exc:
-            self._on_scan_failed(f"Error inicializando MySQL: {exc}")
+            self._on_scan_failed(f"Error inicializando escaneo: {exc}")
             return
+        self._ensure_scan_api_view()
         self._enqueue_scan_log(f"Cargando pagina de followings: {scan_url}")
         web_view = scan_tab.web_view
         web_view.setUrl(QUrl(scan_url))
@@ -332,7 +378,7 @@ class BrowserWindow(QMainWindow):
                     ]
                     skipped = before_count - len(self.scan_pending_candidates)
                     self._enqueue_scan_log(
-                        f"Saltados por cache MySQL con descripcion y URLs: {skipped}"
+                        f"Saltados por cache MySQL con descripcion: {skipped}"
                     )
             self.scan_total_candidates = len(self.scan_pending_candidates)
             self.scan_known_profile_urls = {
@@ -501,6 +547,31 @@ class BrowserWindow(QMainWindow):
         self.tabs.setCurrentIndex(index)
         return self.scan_tab
 
+    def _ensure_scan_api_view(self) -> None:
+        if self.scan_api_view is not None:
+            self.scan_api_view.stop()
+            self.scan_api_view.setUrl(QUrl("https://x.com/home"))
+            return
+        self.scan_api_view = self._create_web_view()
+        self.scan_api_view.loadFinished.connect(self._on_scan_api_view_loaded)
+        self.scan_api_view.setUrl(QUrl("https://x.com/home"))
+
+    def _on_scan_api_view_loaded(self, ok: bool) -> None:
+        self.scan_api_ready = bool(ok)
+        if not ok:
+            self._enqueue_scan_log("UserByScreenName: no se pudo inicializar origen x.com")
+            pending = list(self.scan_api_queue)
+            self.scan_api_queue = []
+            for worker_idx, profile_url in pending:
+                self._skip_worker_profile(
+                    worker_idx, profile_url, "origen x.com no disponible"
+                )
+            return
+        pending = list(self.scan_api_queue)
+        self.scan_api_queue = []
+        for worker_idx, profile_url in pending:
+            self._run_profile_api_fetch(worker_idx, profile_url)
+
     def _scan_parallel_workers(self) -> int:
         value = self._scan_setting_int("scan_parallel_requests", 4, minimum=2)
         return 4 if value >= 4 else 2
@@ -520,13 +591,13 @@ class BrowserWindow(QMainWindow):
             self.scan_worker_states[idx] = {
                 "busy": True,
                 "candidate": candidate,
-                "phase": "loading_profile",
+                "phase": "loading_profile_api",
             }
             url = str(candidate.get("url", ""))
-            worker_view.setUrl(QUrl(url))
             self._enqueue_scan_log(
-                f"[{len(self.scan_results) + 1}/{self.scan_total_candidates}] Worker {idx + 1}: {url}"
+                f"[{len(self.scan_results) + 1}/{self.scan_total_candidates}] Worker {idx + 1}: API {url}"
             )
+            self._fetch_profile_api_for_worker(idx, url)
 
         if (
             self.scan_running
@@ -556,6 +627,180 @@ class BrowserWindow(QMainWindow):
             return
 
         self._collect_worker_data(worker_idx, retries_left=10)
+
+    def _fetch_profile_api_for_worker(self, worker_idx: int, profile_url: str) -> None:
+        if not self.scan_running or self.scan_api_template is None:
+            return
+        screen_name = profile_url.rstrip("/").rsplit("/", 1)[-1].strip()
+        if not screen_name:
+            self._skip_worker_profile(worker_idx, profile_url, "handle vacio")
+            return
+        state = self.scan_worker_states[worker_idx]
+        if not isinstance(state, dict):
+            return
+        state["api_profile_url"] = profile_url
+        if not self.scan_api_ready or self.scan_api_view is None:
+            self.scan_api_queue.append((worker_idx, profile_url))
+            return
+        self._run_profile_api_fetch(worker_idx, profile_url)
+
+    def _run_profile_api_fetch(self, worker_idx: int, profile_url: str) -> None:
+        if not self.scan_running or self.scan_api_template is None or self.scan_api_view is None:
+            return
+        state = self.scan_worker_states[worker_idx]
+        if not isinstance(state, dict):
+            return
+        state["phase"] = "fetching_profile_api"
+        fetch_token = f"{worker_idx}-{int(time.time() * 1000)}"
+        state["api_fetch_token"] = fetch_token
+        state["api_poll_left"] = 60
+        variables = {
+            "screen_name": profile_url.rstrip("/").rsplit("/", 1)[-1].strip(),
+            "withGrokTranslatedBio": True,
+        }
+        query = {
+            "variables": json.dumps(variables, separators=(",", ":")),
+            "features": str(self.scan_api_template.get("features", "{}")),
+            "fieldToggles": str(self.scan_api_template.get("field_toggles", "{}")),
+        }
+        api_path = str(self.scan_api_template.get("path", "")).strip()
+        api_url = f"https://x.com{api_path}?{urlencode(query)}"
+        fetch_headers = {
+            "accept": "*/*",
+            "content-type": "application/json",
+        }
+        if BrowserWindow.profile_cookies.get("ct0", ""):
+            fetch_headers["x-csrf-token"] = BrowserWindow.profile_cookies["ct0"]
+        headers = self.scan_api_template.get("headers", {})
+        if isinstance(headers, dict):
+            for name, value in headers.items():
+                if value:
+                    fetch_headers[str(name).lower()] = str(value)
+        script = f"""
+        (() => {{
+            window.__artbrowser_api_results = window.__artbrowser_api_results || {{}};
+            const token = {json.dumps(fetch_token)};
+            const headers = {json.dumps(fetch_headers)};
+            if (!headers['x-csrf-token']) {{
+                const match = document.cookie.match(/(?:^|; )ct0=([^;]+)/);
+                if (match) headers['x-csrf-token'] = decodeURIComponent(match[1]);
+            }}
+            window.__artbrowser_api_results[token] = {{ done: false, ok: false, status: 0, text: '' }};
+            fetch({json.dumps(api_url)}, {{
+                credentials: 'include',
+                headers
+            }})
+                .then((response) =>
+                    response.text().then((text) => {{
+                        window.__artbrowser_api_results[token] = {{
+                            done: true,
+                            ok: response.ok,
+                            status: response.status,
+                            text
+                        }};
+                    }})
+                )
+                .catch((error) => {{
+                    window.__artbrowser_api_results[token] = {{
+                        done: true,
+                        ok: false,
+                        status: 0,
+                        text: String(error && error.message || error)
+                    }};
+                }});
+            return true;
+        }})()
+        """
+        self.scan_api_view.page().runJavaScript(
+            script,
+            lambda _data, idx=worker_idx, url=profile_url: self._poll_profile_api_result(idx, url),
+        )
+
+    def _poll_profile_api_result(self, worker_idx: int, profile_url: str) -> None:
+        if not self.scan_running or self.scan_api_view is None:
+            return
+        state = self.scan_worker_states[worker_idx]
+        if not isinstance(state, dict) or state.get("phase") != "fetching_profile_api":
+            return
+        token = str(state.get("api_fetch_token", "")).strip()
+        retries_left = int(state.get("api_poll_left", 0))
+        if not token:
+            self._skip_worker_profile(worker_idx, profile_url, "UserByScreenName token vacio")
+            return
+        if retries_left <= 0:
+            self._skip_worker_profile(worker_idx, profile_url, "UserByScreenName timeout")
+            return
+        state["api_poll_left"] = retries_left - 1
+        script = f"""
+        (() => {{
+            const store = window.__artbrowser_api_results || {{}};
+            return store[{json.dumps(token)}] || null;
+        }})()
+        """
+        self.scan_api_view.page().runJavaScript(
+            script,
+            lambda data, idx=worker_idx, url=profile_url: self._on_profile_api_result_polled(idx, url, data),
+        )
+
+    def _on_profile_api_result_polled(
+        self, worker_idx: int, profile_url: str, data: object
+    ) -> None:
+        if not self.scan_running:
+            return
+        state = self.scan_worker_states[worker_idx]
+        if not isinstance(state, dict) or state.get("phase") != "fetching_profile_api":
+            return
+        if not isinstance(data, dict) or not bool(data.get("done", False)):
+            QTimer.singleShot(120, lambda: self._poll_profile_api_result(worker_idx, profile_url))
+            return
+        status = 0
+        raw = ""
+        ok = False
+        try:
+            status = int(data.get("status", 0))
+        except (TypeError, ValueError):
+            status = 0
+        raw = str(data.get("text", ""))
+        ok = bool(data.get("ok", False))
+        if not ok or status != 200:
+            excerpt = re.sub(r"\s+", " ", raw).strip()[:180]
+            self._enqueue_scan_log(
+                f"Worker {worker_idx + 1}: UserByScreenName fallo HTTP {status or 0}"
+            )
+            if excerpt:
+                self._enqueue_scan_log(
+                    f"Worker {worker_idx + 1}: detalle API: {excerpt}"
+                )
+            self._skip_worker_profile(worker_idx, profile_url, "UserByScreenName fallo")
+            return
+        try:
+            payload = json.loads(raw)
+            row = build_profile_row_from_api_json(profile_url, payload)
+        except Exception as exc:
+            self._enqueue_scan_log(
+                f"Worker {worker_idx + 1}: UserByScreenName invalido: {exc}"
+            )
+            self._skip_worker_profile(worker_idx, profile_url, "UserByScreenName invalido")
+            return
+
+        expected_handle = profile_url.rstrip("/").rsplit("/", 1)[-1].lower()
+        detected_handle = str(row.get("detected_handle", "")).strip().lower()
+        if detected_handle and detected_handle != expected_handle:
+            self._skip_worker_profile(worker_idx, profile_url, "handle API no coincide")
+            return
+        if not str(row.get("description", "")).strip():
+            self._skip_worker_profile(worker_idx, profile_url, "descripcion no cargada")
+            return
+        candidate = state.get("candidate")
+        if isinstance(candidate, dict):
+            group_hint = str(candidate.get("group_hint", "")).strip()
+            agency_hint = str(candidate.get("agency_hint", "")).strip()
+            if group_hint:
+                row["group_hint"] = group_hint
+            if agency_hint:
+                row["agency_hint"] = agency_hint
+        row.pop("detected_handle", None)
+        self._start_resolving_row_urls_with_worker(worker_idx, row)
 
     def _collect_worker_data(self, worker_idx: int, retries_left: int) -> None:
         if not self.scan_running or self.scan_tab is None:
@@ -802,6 +1047,11 @@ class BrowserWindow(QMainWindow):
                     continue
                 raw_urls = item.get("urls", [])
                 urls = raw_urls if isinstance(raw_urls, list) else []
+                raw_categories = item.get("artist_categories", [])
+                categories = raw_categories if isinstance(raw_categories, list) else []
+                categories_text = ", ".join(str(value) for value in categories if str(value).strip())
+                if not categories_text:
+                    categories_text = str(item.get("artist_category", "general"))
                 urls_html = " ".join(
                     f"<a href='{escape(str(url), quote=True)}'>{escape(str(url))}</a>"
                     for url in urls[:4]
@@ -811,7 +1061,7 @@ class BrowserWindow(QMainWindow):
                     "<tr>"
                     f"<td><a href='{escape(profile_url, quote=True)}'>{escape(profile_url)}</a></td>"
                     f"<td>{escape(str(item.get('title', '')))}</td>"
-                    f"<td>{escape(str(item.get('artist_category', 'general')))}</td>"
+                    f"<td>{escape(categories_text)}</td>"
                     f"<td>{escape(str(item.get('content_rating', 'unknown')))}</td>"
                     f"<td>{escape(str(item.get('description', '')))}</td>"
                     f"<td>{urls_html}</td>"
@@ -940,18 +1190,40 @@ class BrowserWindow(QMainWindow):
     def _classify_profile_row(self, row: dict[str, str | int | list[str]]) -> None:
         title = str(row.get("title", ""))
         description = str(row.get("description", ""))
+        profile_url = str(row.get("url", ""))
+        profile_handle = profile_url.rstrip("/").rsplit("/", 1)[-1]
         urls = row.get("urls", [])
         url_blob = " ".join(str(item) for item in urls) if isinstance(urls, list) else ""
         haystack = f"{title} {description} {url_blob}".lower()
-        description_lower = description.lower()
-        category = ""
-        if "vtuber" in description_lower or "ママ" in description or "パパ" in description:
-            category = "vtuber"
-        elif any(token in haystack for token in ("twitch.tv", "kick.com")):
-            category = "stream"
-        elif any(token in haystack for token in ("illustrator", "draw", "dibujo", "pixiv", "fanbox.cc")):
-            category = "illustrator"
-        row["artist_category"] = category or "general"
+        categories: list[str] = []
+        vtuber_markers = (
+            "vtuber" in haystack
+            or "ママ" in description
+            or "パパ" in description
+            or "VT" in title
+            or "VT" in profile_handle
+            or profile_handle.lower().endswith("_vt")
+        )
+        if vtuber_markers:
+            categories.append("vtuber")
+        if any(token in haystack for token in ("twitch.tv", "kick.com", "youtube.com", "youtu.be")):
+            categories.append("stream")
+        if any(token in haystack for token in ("illustrator", "draw", "dibujo", "pixiv", "fanbox.cc")):
+            categories.append("illustrator")
+        if not categories:
+            categories = ["general"]
+        row["artist_categories"] = categories
+        row["artist_category"] = categories[0]
+        metadata = extract_vtuber_metadata(description)
+        group_hint = str(row.get("group_hint", "")).strip()
+        agency_hint = str(row.get("agency_hint", "")).strip()
+        if group_hint and not metadata.get("grupo"):
+            metadata["grupo"] = group_hint
+        if not metadata.get("grupo") and "katabasis" in f"{title} {description} {profile_handle}".lower():
+            metadata["grupo"] = "Katabasis"
+        if agency_hint and not metadata.get("agencia"):
+            metadata["agencia"] = agency_hint
+        row["vtuber_metadata"] = metadata
         if re.search(r"(^|[^a-z0-9])r18([^a-z0-9]|$)", title, re.IGNORECASE) or "+18" in title or "🔞" in title:
             row["content_rating"] = "nsfw"
         else:
@@ -1278,7 +1550,15 @@ class BrowserWindow(QMainWindow):
 
         candidates: list[str] = []
         description = str(row.get("description", "")).strip()
+        metadata = row.get("vtuber_metadata", {})
+        group_hint = ""
+        agency_hint = ""
+        if isinstance(metadata, dict):
+            group_hint = str(metadata.get("grupo", "") or "").strip()
+            agency_hint = str(metadata.get("agencia", "") or "").strip()
         for handle in extract_handles_from_description(description):
+            if self._is_blocked_related_handle(handle):
+                continue
             candidates.append(f"https://x.com/{handle}")
 
         urls = row.get("urls", [])
@@ -1293,6 +1573,8 @@ class BrowserWindow(QMainWindow):
                 if host in {"x.com", "www.x.com", "mobile.x.com"} and re.fullmatch(
                     r"[A-Za-z0-9_]{1,15}", path
                 ):
+                    if self._is_blocked_related_handle(path):
+                        continue
                     candidates.append(f"https://x.com/{path}")
 
         added = 0
@@ -1303,11 +1585,22 @@ class BrowserWindow(QMainWindow):
             if len(self.scan_results) + len(self.scan_pending_candidates) >= self.scan_max_profiles:
                 break
             self.scan_known_profile_urls.add(lower)
-            self.scan_pending_candidates.append({"url": raw})
+            candidate = {"url": raw}
+            if group_hint:
+                candidate["group_hint"] = group_hint
+            if agency_hint:
+                candidate["agency_hint"] = agency_hint
+            self.scan_pending_candidates.append(candidate)
             self.scan_total_candidates += 1
             added += 1
         if added > 0:
             self._enqueue_scan_log(f"Perfiles relacionados encolados: +{added}")
+
+    def _is_blocked_related_handle(self, handle: str) -> bool:
+        value = str(handle).strip().lower()
+        if not value:
+            return True
+        return value in self.RELATED_PROFILE_BLOCKLIST
 
     def _save_current_page(self) -> None:
         view = self.current_view()

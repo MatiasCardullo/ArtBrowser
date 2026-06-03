@@ -4,13 +4,29 @@ import json
 import re
 from datetime import datetime
 from html import unescape
-from urllib.parse import urlparse
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from bs4 import BeautifulSoup
 from bs4.element import Tag
 
 MYSQL_PROFILE_TABLE = "twitter_profiles"
 MYSQL_DONATION_TABLE = "donation_sites"
+MYSQL_VTUBER_TABLE = "vtubers"
+USER_BY_SCREEN_NAME_HAR = "UserByScreenName_Archive [26-05-25 16-59-07].har"
+
+KNOWN_VTUBER_AGENCIES = {
+    "hololive",
+    "hololive en",
+    "holostars",
+    "nijisanji",
+    "nijisanji en",
+    "vshojo",
+    "phase connect",
+    "idol corp",
+    "first stage production",
+    "specialite",
+}
 
 
 def is_ignored_profile_url(raw_url: str) -> bool:
@@ -378,6 +394,200 @@ def normalize_urls(value: object) -> list[str]:
     return normalized
 
 
+def normalize_string_list(value: object) -> list[str]:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        try:
+            decoded = json.loads(stripped)
+            value = decoded
+        except json.JSONDecodeError:
+            value = [stripped]
+    if not isinstance(value, list):
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        text = str(item).strip()
+        lower = text.lower()
+        if not text or lower in seen:
+            continue
+        seen.add(lower)
+        normalized.append(text)
+    return normalized
+
+
+def infer_urls_from_description(description: str) -> list[str]:
+    text = str(description or "")
+    if not text:
+        return []
+    patterns = (
+        (r"(?:ko[\s\-]?fi)\s*[:：]\s*@?([A-Za-z0-9._-]{2,64})", "https://ko-fi.com/{handle}"),
+        (r"(?:vgen)\s*[:：]\s*@?([A-Za-z0-9._-]{2,64})", "https://vgen.co/{handle}"),
+        (r"(?:twitch)\s*[:：]\s*@?([A-Za-z0-9_]{2,32})", "https://twitch.tv/{handle}"),
+        (r"(?:kick)\s*[:：]\s*@?([A-Za-z0-9_]{2,32})", "https://kick.com/{handle}"),
+    )
+    inferred: list[str] = []
+    seen: set[str] = set()
+    for pattern, template in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            handle = str(match.group(1) or "").strip().strip("/")
+            handle = handle.lstrip("@")
+            if not handle:
+                continue
+            url = template.format(handle=handle)
+            if url in seen or is_ignored_profile_url(url):
+                continue
+            seen.add(url)
+            inferred.append(url)
+    return inferred
+
+
+def extract_vtuber_metadata(description: str) -> dict[str, str]:
+    text = str(description or "")
+    values = {
+        "papa": "",
+        "mama": "",
+        "agencia": "",
+        "grupo": "",
+    }
+    if not text:
+        return values
+
+    field_patterns = (
+        ("mama", r"(?:mama|ママ)\s*[:：]\s*@?([A-Za-z0-9_]{1,15})"),
+        ("papa", r"(?:papa|パパ)\s*[:：]\s*@?([A-Za-z0-9_]{1,15})"),
+        (
+            "agencia",
+            r"(?:agency|agencia|affiliation|所属)\s*[:：]\s*(.+?)(?=\s+(?:group|grupo|unit|agency|agencia|affiliation|mama|papa|ママ|パパ|所属)\s*[:：]|[|/\n\r,;]|$)",
+        ),
+        (
+            "grupo",
+            r"(?:group|grupo|unit)\s*[:：]\s*(.+?)(?=\s+(?:group|grupo|unit|agency|agencia|affiliation|mama|papa|ママ|パパ|所属)\s*[:：]|[|/\n\r,;]|$)",
+        ),
+    )
+    for field, pattern in field_patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            values[field] = clean_text(str(match.group(1))).strip(" .,:;|/")
+
+    lowered = text.lower()
+    if not values["grupo"]:
+        for group in sorted(KNOWN_VTUBER_GROUPS, key=len, reverse=True):
+            if re.search(rf"(?<![a-z0-9]){re.escape(group)}(?![a-z0-9])", lowered):
+                values["grupo"] = group.title()
+                break
+    if not values["agencia"]:
+        for agency in sorted(KNOWN_VTUBER_AGENCIES, key=len, reverse=True):
+            if re.search(rf"(?<![a-z0-9]){re.escape(agency)}(?![a-z0-9])", lowered):
+                values["agencia"] = agency.title()
+                break
+    return values
+
+
+def load_user_by_screen_name_template(base_dir: Path) -> dict[str, object]:
+    path = base_dir / USER_BY_SCREEN_NAME_HAR
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    entries = raw.get("log", {}).get("entries", [])
+    if not isinstance(entries, list) or not entries:
+        raise ValueError(f"No HAR entries found in {path.name}")
+    request = entries[0].get("request", {})
+    url = str(request.get("url", ""))
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+    headers: dict[str, str] = {}
+    for item in request.get("headers", []):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip().lower()
+        value = str(item.get("value", "")).strip()
+        if name in {
+            "authorization",
+            "x-twitter-client-language",
+            "x-twitter-active-user",
+            "x-twitter-auth-type",
+            "x-client-transaction-id",
+        } and value:
+            headers[name] = value
+    return {
+        "path": parsed.path,
+        "features": params.get("features", ["{}"])[0],
+        "field_toggles": params.get("fieldToggles", ["{}"])[0],
+        "headers": headers,
+    }
+
+
+def build_profile_row_from_api_json(
+    profile_url: str,
+    payload: object,
+) -> dict[str, str | int | list[str]]:
+    if not isinstance(payload, dict):
+        raise ValueError("UserByScreenName response is not an object")
+    result = (
+        payload.get("data", {})
+        if isinstance(payload.get("data"), dict)
+        else {}
+    )
+    user = result.get("user", {}) if isinstance(result, dict) else {}
+    result_user = user.get("result", {}) if isinstance(user, dict) else {}
+    if not isinstance(result_user, dict) or result_user.get("__typename") != "User":
+        raise ValueError("UserByScreenName did not return a User")
+
+    core = result_user.get("core", {})
+    legacy = result_user.get("legacy", {})
+    profile_bio = result_user.get("profile_bio", {})
+    if not isinstance(core, dict):
+        core = {}
+    if not isinstance(legacy, dict):
+        legacy = {}
+    if not isinstance(profile_bio, dict):
+        profile_bio = {}
+
+    title = clean_text(str(core.get("name", "") or profile_handle_from_url(profile_url)))
+    description = clean_text(
+        str(profile_bio.get("description", "") or legacy.get("description", "") or "")
+    )
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def add_url(raw: object) -> None:
+        value = str(raw or "").strip()
+        if not value or is_ignored_profile_url(value):
+            return
+        if value in seen:
+            return
+        seen.add(value)
+        urls.append(value)
+
+    entities = legacy.get("entities", {})
+    if isinstance(entities, dict):
+        for section_name in ("url", "description"):
+            section = entities.get(section_name, {})
+            if not isinstance(section, dict):
+                continue
+            for item in section.get("urls", []):
+                if not isinstance(item, dict):
+                    continue
+                add_url(item.get("expanded_url") or item.get("url"))
+
+    for match in re.findall(r"(https?://[^\s<>\"]+)", description):
+        text_url = match.rstrip(").,;!?")
+        if not is_tco_url(text_url):
+            add_url(text_url)
+    for inferred_url in infer_urls_from_description(description):
+        add_url(inferred_url)
+
+    detected_handle = str(core.get("screen_name", "") or "").strip()
+    return {
+        "url": profile_url,
+        "title": title,
+        "description": description,
+        "urls": urls,
+        "detected_handle": detected_handle,
+    }
+
+
 def _mysql_driver():
     try:
         import pymysql  # type: ignore[import-not-found]
@@ -416,6 +626,7 @@ def ensure_scan_db(db_config: dict[str, object]) -> None:
     database_sql = _mysql_identifier(database)
     table_sql = _mysql_identifier(MYSQL_PROFILE_TABLE)
     donation_table_sql = _mysql_identifier(MYSQL_DONATION_TABLE)
+    vtuber_table_sql = _mysql_identifier(MYSQL_VTUBER_TABLE)
     conn = _mysql_connection(db_config, with_database=False)
     cursor = conn.cursor()
     cursor.execute(
@@ -437,6 +648,7 @@ def ensure_scan_db(db_config: dict[str, object]) -> None:
             description TEXT NOT NULL,
             urls JSON NOT NULL,
             artist_category VARCHAR(64) NOT NULL DEFAULT 'general',
+            artist_categories JSON NOT NULL,
             content_rating VARCHAR(16) NOT NULL DEFAULT 'unknown',
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             INDEX idx_twitter_profiles_profile_url (profile_url(191)),
@@ -480,9 +692,20 @@ def ensure_scan_db(db_config: dict[str, object]) -> None:
         cursor.execute(
             f"ALTER TABLE {table_sql} ADD COLUMN artist_category VARCHAR(64) NOT NULL DEFAULT 'general' AFTER urls"
         )
+    if "artist_categories" not in columns:
+        cursor.execute(
+            f"ALTER TABLE {table_sql} ADD COLUMN artist_categories JSON NULL AFTER artist_category"
+        )
+        cursor.execute(
+            f"UPDATE {table_sql} SET artist_categories = JSON_ARRAY(artist_category)"
+        )
+    else:
+        cursor.execute(
+            f"UPDATE {table_sql} SET artist_categories = JSON_ARRAY(artist_category) WHERE artist_categories IS NULL"
+        )
     if "content_rating" not in columns:
         cursor.execute(
-            f"ALTER TABLE {table_sql} ADD COLUMN content_rating VARCHAR(16) NOT NULL DEFAULT 'unknown' AFTER artist_category"
+            f"ALTER TABLE {table_sql} ADD COLUMN content_rating VARCHAR(16) NOT NULL DEFAULT 'unknown' AFTER artist_categories"
         )
     cursor.execute(
         f"""
@@ -496,6 +719,21 @@ def ensure_scan_db(db_config: dict[str, object]) -> None:
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             INDEX idx_donation_sites_profile (profile_url(191)),
             INDEX idx_donation_sites_host (host)
+        ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """
+    )
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {vtuber_table_sql} (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            perfil VARCHAR(512) NOT NULL,
+            name TEXT NOT NULL,
+            papa TEXT NOT NULL,
+            mama TEXT NOT NULL,
+            agencia TEXT NOT NULL,
+            grupo TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_vtubers_perfil (perfil(191))
         ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """
     )
@@ -516,7 +754,6 @@ def get_success_profile_urls(db_config: dict[str, object], urls: list[str]) -> s
         "SELECT LOWER(profile_url) "
         f"FROM {_mysql_identifier(MYSQL_PROFILE_TABLE)} "
         f"WHERE TRIM(description) <> '' "
-        "AND JSON_LENGTH(urls) > 0 "
         f"AND LOWER(profile_url) IN ({placeholders})"
     )
     cursor.execute(query, normalized)
@@ -533,18 +770,19 @@ def get_scan_dashboard_data(db_config: dict[str, object], limit: int = 80) -> di
     table_sql = _mysql_identifier(MYSQL_PROFILE_TABLE)
     cursor.execute(f"SELECT COUNT(*) FROM {table_sql}")
     total_profiles = int(cursor.fetchone()[0])
+    cursor.execute(f"SELECT artist_categories FROM {table_sql}")
+    category_counter: dict[str, int] = {}
+    for row in cursor.fetchall():
+        values = normalize_string_list(row[0] if row else [])
+        if not values:
+            values = ["general"]
+        for value in values:
+            key = str(value).strip().lower() or "general"
+            category_counter[key] = category_counter.get(key, 0) + 1
+    categories = sorted(category_counter.items(), key=lambda item: (-item[1], item[0]))
     cursor.execute(
         f"""
-        SELECT artist_category, COUNT(*)
-        FROM {table_sql}
-        GROUP BY artist_category
-        ORDER BY COUNT(*) DESC, artist_category ASC
-        """
-    )
-    categories = [(str(row[0] or "general"), int(row[1])) for row in cursor.fetchall()]
-    cursor.execute(
-        f"""
-        SELECT profile_url, title, description, urls, artist_category, content_rating, generated_at
+        SELECT profile_url, title, description, urls, artist_category, artist_categories, content_rating, generated_at
         FROM {table_sql}
         ORDER BY generated_at DESC, id DESC
         LIMIT %s
@@ -560,8 +798,9 @@ def get_scan_dashboard_data(db_config: dict[str, object], limit: int = 80) -> di
                 "description": str(row[2] or ""),
                 "urls": normalize_urls(row[3]),
                 "artist_category": str(row[4] or "general"),
-                "content_rating": str(row[5] or "unknown"),
-                "generated_at": str(row[6] or ""),
+                "artist_categories": normalize_string_list(row[5]),
+                "content_rating": str(row[6] or "unknown"),
+                "generated_at": str(row[7] or ""),
             }
         )
     cursor.close()
@@ -583,6 +822,9 @@ def build_profile_row_from_html(
     title = extract_title_from_banner(banner, profile_handle)
     description = extract_description_from_banner(banner)
     urls = extract_urls_from_banner(banner)
+    for inferred_url in infer_urls_from_description(description):
+        if inferred_url not in urls and not is_ignored_profile_url(inferred_url):
+            urls.append(inferred_url)
     return {
         "url": profile_url,
         "title": title,
@@ -597,6 +839,12 @@ def save_scan_results(
     rows: list[dict[str, str | int | list[str]]],
     ensure_db: bool = True,
 ) -> int:
+    unique_rows: dict[str, dict[str, str | int | list[str]]] = {}
+    for item in rows:
+        key = str(item.get("url", "")).strip().lower()
+        if key:
+            unique_rows[key] = item
+    rows = list(unique_rows.values())
     profile_count = len(rows)
     if profile_count == 0:
         return 0
@@ -606,6 +854,21 @@ def save_scan_results(
     cursor = conn.cursor()
     generated_at = datetime.now()
     table_sql = _mysql_identifier(MYSQL_PROFILE_TABLE)
+    vtuber_table_sql = _mysql_identifier(MYSQL_VTUBER_TABLE)
+    profile_urls = [str(item["url"]).strip().lower() for item in rows if str(item["url"]).strip()]
+    if profile_urls:
+        placeholders = ", ".join("%s" for _ in profile_urls)
+        cursor.execute(
+            f"DELETE FROM {table_sql} WHERE LOWER(profile_url) IN ({placeholders})",
+            profile_urls,
+        )
+        cursor.execute(
+            f"""
+            DELETE FROM {_mysql_identifier(MYSQL_DONATION_TABLE)}
+            WHERE LOWER(profile_url) IN ({placeholders})
+            """,
+            profile_urls,
+        )
     cursor.executemany(
         f"""
         INSERT INTO {table_sql} (
@@ -615,9 +878,10 @@ def save_scan_results(
             description,
             urls,
             artist_category,
+            artist_categories,
             content_rating
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """,
         [
             (
@@ -627,6 +891,10 @@ def save_scan_results(
                 str(item["description"]),
                 json.dumps(normalize_urls(item.get("urls", [])), ensure_ascii=False),
                 str(item.get("artist_category", "general") or "general"),
+                json.dumps(
+                    normalize_string_list(item.get("artist_categories", [])) or ["general"],
+                    ensure_ascii=False,
+                ),
                 str(item.get("content_rating", "unknown") or "unknown"),
             )
             for item in rows
@@ -634,8 +902,26 @@ def save_scan_results(
     )
     conn.commit()
     donation_rows: list[tuple[object, str, str, str, str]] = []
+    vtuber_rows: list[tuple[str, str, str, str, str, str]] = []
     for item in rows:
         profile_url = str(item["url"])
+        categories = normalize_string_list(item.get("artist_categories", []))
+        if not categories:
+            categories = [str(item.get("artist_category", "general") or "general")]
+        if "vtuber" in {value.lower() for value in categories}:
+            metadata = item.get("vtuber_metadata", {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            vtuber_rows.append(
+                (
+                    profile_url,
+                    str(item.get("title", "")),
+                    str(metadata.get("papa", "") or ""),
+                    str(metadata.get("mama", "") or ""),
+                    str(metadata.get("agencia", "") or ""),
+                    str(metadata.get("grupo", "") or ""),
+                )
+            )
         raw_sites = item.get("donation_sites", [])
         if not isinstance(raw_sites, list):
             continue
@@ -662,6 +948,28 @@ def save_scan_results(
             VALUES (%s, %s, %s, %s, %s)
             """,
             donation_rows,
+        )
+        conn.commit()
+    if vtuber_rows:
+        cursor.executemany(
+            f"""
+            INSERT INTO {vtuber_table_sql} (
+                perfil,
+                name,
+                papa,
+                mama,
+                agencia,
+                grupo
+            )
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                name = VALUES(name),
+                papa = VALUES(papa),
+                mama = VALUES(mama),
+                agencia = VALUES(agencia),
+                grupo = VALUES(grupo)
+            """,
+            vtuber_rows,
         )
         conn.commit()
     cursor.close()

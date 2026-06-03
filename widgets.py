@@ -70,7 +70,7 @@ class SettingsTab(QWidget):
         )
         form.addRow("Workers paralelos (2 o 4):", self.parallel_workers_input)
 
-        self.skip_already_ok_checkbox = QCheckBox("Saltar perfiles con descripcion y URLs")
+        self.skip_already_ok_checkbox = QCheckBox("Saltar perfiles con descripcion")
         self.skip_already_ok_checkbox.setChecked(
             bool(initial_settings.get("scan_skip_already_ok", True))
         )
