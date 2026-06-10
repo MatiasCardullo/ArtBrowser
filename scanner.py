@@ -14,13 +14,12 @@ MYSQL_PROFILE_TABLE = "twitter_profiles"
 MYSQL_DONATION_TABLE = "donation_sites"
 MYSQL_VTUBER_TABLE = "vtubers"
 USER_BY_SCREEN_NAME_HAR = "UserByScreenName_Archive [26-05-25 16-59-07].har"
+FOLLOWING_API_HAR_PATTERN = "x.com_i_api_graphql_Following_Archive*.har"
 
 KNOWN_VTUBER_AGENCIES = {
     "hololive",
-    "hololive en",
     "holostars",
     "nijisanji",
-    "nijisanji en",
     "vshojo",
     "phase connect",
     "idol corp",
@@ -473,11 +472,6 @@ def extract_vtuber_metadata(description: str) -> dict[str, str]:
             values[field] = clean_text(str(match.group(1))).strip(" .,:;|/")
 
     lowered = text.lower()
-    if not values["grupo"]:
-        for group in sorted(KNOWN_VTUBER_GROUPS, key=len, reverse=True):
-            if re.search(rf"(?<![a-z0-9]){re.escape(group)}(?![a-z0-9])", lowered):
-                values["grupo"] = group.title()
-                break
     if not values["agencia"]:
         for agency in sorted(KNOWN_VTUBER_AGENCIES, key=len, reverse=True):
             if re.search(rf"(?<![a-z0-9]){re.escape(agency)}(?![a-z0-9])", lowered):
@@ -518,12 +512,367 @@ def load_user_by_screen_name_template(base_dir: Path) -> dict[str, object]:
     }
 
 
+def load_following_api_template(base_dir: Path) -> dict[str, object]:
+    """Load Following GraphQL API template from HAR files."""
+    import glob
+    
+    # Find the most recent Following HAR file
+    har_files = sorted(glob.glob(str(base_dir / "x.com_i_api_graphql_Following_Archive*.har")), reverse=True)
+    if not har_files:
+        raise ValueError(f"No Following HAR files found in {base_dir}")
+    
+    path = Path(har_files[0])
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    entries = raw.get("log", {}).get("entries", [])
+    if not isinstance(entries, list) or not entries:
+        raise ValueError(f"No HAR entries found in {path.name}")
+    
+    request = entries[0].get("request", {})
+    url = str(request.get("url", ""))
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+    
+    # Extract the API path and operation ID from URL
+    path_str = str(parsed.path)
+    # Path format: /i/api/graphql/{operation_id}/Following
+    
+    headers: dict[str, str] = {}
+    for item in request.get("headers", []):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip().lower()
+        value = str(item.get("value", "")).strip()
+        if name in {
+            "authorization",
+            "x-twitter-client-language",
+            "x-twitter-active-user",
+            "x-twitter-auth-type",
+            "x-client-transaction-id",
+        } and value:
+            headers[name] = value
+    
+    return {
+        "path": path_str,
+        "features": params.get("features", ["{}"])[0],
+        "field_toggles": params.get("fieldToggles", ["{}"])[0],
+        "headers": headers,
+    }
+
+
+def extract_profiles_from_following_response(response_data: object) -> list[dict[str, str]]:
+    """Extract profile handles and details from Following GraphQL response."""
+    if not isinstance(response_data, dict):
+        return []
+    
+    profiles: list[dict[str, str]] = []
+    seen: set[str] = set()
+    
+    try:
+        data = response_data.get("data", {})
+        if not isinstance(data, dict):
+            return []
+        
+        user_obj = data.get("user", {})
+        if not isinstance(user_obj, dict):
+            return []
+        
+        result_obj = user_obj.get("result", {})
+        if not isinstance(result_obj, dict):
+            return []
+        
+        timeline_obj = result_obj.get("timeline", {})
+        if not isinstance(timeline_obj, dict):
+            return []
+        
+        timeline_timeline = timeline_obj.get("timeline", {})
+        if not isinstance(timeline_timeline, dict):
+            return []
+        
+        instructions = timeline_timeline.get("instructions", [])
+        if not isinstance(instructions, list):
+            return []
+        
+        for instruction in instructions:
+            if not isinstance(instruction, dict):
+                continue
+            
+            entries = instruction.get("entries", [])
+            if not isinstance(entries, list):
+                continue
+            
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                
+                content = entry.get("content", {})
+                if not isinstance(content, dict):
+                    continue
+                
+                item_content = content.get("itemContent", {})
+                if not isinstance(item_content, dict):
+                    continue
+                
+                user_results = item_content.get("user_results", {})
+                if not isinstance(user_results, dict):
+                    continue
+                
+                user_result = user_results.get("result", {})
+                if not isinstance(user_result, dict):
+                    continue
+                
+                core = user_result.get("core", {})
+                if not isinstance(core, dict):
+                    continue
+                
+                screen_name = str(core.get("screen_name", "")).strip()
+                # Validate screen_name: must be 1-15 alphanumeric + underscore, not empty
+                if not screen_name:
+                    continue
+                if not re.fullmatch(r"[A-Za-z0-9_]{1,15}", screen_name):
+                    # Invalid handle format, skip
+                    continue
+                if screen_name.lower() in seen:
+                    continue
+                
+                seen.add(screen_name.lower())
+                
+                # Extract profile information from the response
+                legacy = user_result.get("legacy", {})
+                if not isinstance(legacy, dict):
+                    legacy = {}
+                
+                profile_bio = user_result.get("profile_bio", {})
+                if not isinstance(profile_bio, dict):
+                    profile_bio = {}
+                
+                name = str(core.get("name", "")).strip()
+                description = clean_text(
+                    str(profile_bio.get("description", "") or legacy.get("description", "") or "")
+                )
+                
+                # Extract URLs
+                urls: list[str] = []
+                seen_urls: set[str] = set()
+                
+                def add_url(raw: object) -> None:
+                    value = str(raw or "").strip()
+                    if not value or is_ignored_profile_url(value):
+                        return
+                    if value in seen_urls:
+                        return
+                    seen_urls.add(value)
+                    urls.append(value)
+                
+                entities = legacy.get("entities", {})
+                if isinstance(entities, dict):
+                    for section_name in ("url", "description"):
+                        section = entities.get(section_name, {})
+                        if not isinstance(section, dict):
+                            continue
+                        for item in section.get("urls", []):
+                            if not isinstance(item, dict):
+                                continue
+                            add_url(item.get("expanded_url") or item.get("url"))
+                
+                # Extract URLs from description text
+                for match in re.findall(r"(https?://[^\s<>\"]+)", description):
+                    text_url = match.rstrip(").,;!?")
+                    if not is_tco_url(text_url):
+                        add_url(text_url)
+                
+                for inferred_url in infer_urls_from_description(description):
+                    add_url(inferred_url)
+                
+                # Final validation: ensure we have a valid screen_name
+                if not screen_name or not re.fullmatch(r"[A-Za-z0-9_]{1,15}", screen_name):
+                    continue
+                
+                profiles.append({
+                    "url": f"https://x.com/{screen_name}",
+                    "title": name or screen_name,
+                    "description": description,
+                    "urls": urls,
+                    "detected_handle": screen_name,
+                    "followers_count": legacy.get("followers_count", 0),
+                    "following_count": legacy.get("friends_count", 0),
+                    "tweet_count": legacy.get("statuses_count", 0),
+                    "vtuber_metadata": extract_vtuber_metadata(description),
+                })
+    
+    except Exception as e:
+        print(f"Error parsing Following response: {e}")
+    
+    return profiles
+
+
+def fetch_following_profiles_from_api(
+    template: dict[str, object],
+    user_id: str,
+    count: int = 100,
+    cursor: str | None = None,
+) -> tuple[list[dict[str, str]], str | None]:
+    """
+    Fetch following profiles directly from Twitter GraphQL API.
+    
+    Args:
+        template: API template from load_following_api_template()
+        user_id: Twitter user ID to get followings for
+        count: Number of profiles per request (default 100, max 100)
+        cursor: Pagination cursor for subsequent requests
+    
+    Returns:
+        Tuple of (profiles_list, next_cursor)
+    """
+    try:
+        from urllib.request import Request, urlopen
+        from urllib.parse import urlencode
+    except ImportError as e:
+        raise RuntimeError(f"Failed to import urllib: {e}") from e
+    
+    try:
+        path = str(template.get("path", ""))
+        features = str(template.get("features", "{}"))
+        field_toggles = str(template.get("field_toggles", "{}"))
+        headers_dict = dict(template.get("headers", {}))
+        
+        # Build variables JSON for GraphQL
+        variables = {
+            "userId": str(user_id).strip(),
+            "count": min(int(count), 100),
+            "includePromotedContent": False,
+            "withGrokTranslatedBio": True,
+        }
+        if cursor:
+            variables["cursor"] = str(cursor).strip()
+        
+        # Build full URL
+        url = f"https://x.com{path}"
+        params = {
+            "variables": json.dumps(variables, separators=(",", ":")),
+            "features": features,
+            "fieldToggles": field_toggles,
+        }
+        full_url = url + "?" + urlencode(params)
+        
+        # Create request with headers
+        req = Request(full_url)
+        headers_dict.update({
+            "content-type": "application/json",
+            "accept": "*/*",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        })
+        for header_name, header_value in headers_dict.items():
+            req.add_header(header_name, str(header_value))
+        
+        # Make request
+        response = urlopen(req, timeout=10)
+        response_data = response.read().decode('utf-8')
+        data = json.loads(response_data)
+        
+        profiles = extract_profiles_from_following_response(data)
+        
+        # Extract next cursor for pagination
+        next_cursor = None
+        try:
+            instructions = (
+                data.get("data", {})
+                .get("user", {})
+                .get("result", {})
+                .get("timeline", {})
+                .get("timeline", {})
+                .get("instructions", [])
+            )
+            for instruction in instructions:
+                if instruction.get("type") == "TimelineCursor" and instruction.get("direction") == "Bottom":
+                    next_cursor = instruction.get("value", "")
+                    break
+        except Exception:
+            pass
+        
+        return profiles, next_cursor
+    
+    except Exception as e:
+        print(f"Error fetching Following profiles: {e}")
+        return [], None
+
+
+def extract_user_id_from_profile_response(profile_response: object) -> str:
+    """Extract user ID from UserByScreenName API response."""
+    if not isinstance(profile_response, dict):
+        return ""
+    try:
+        user_result = (
+            profile_response.get("data", {})
+            .get("user", {})
+            .get("result", {})
+        )
+        if isinstance(user_result, dict):
+            user_id = user_result.get("id", "")
+            if user_id:
+                return str(user_id)
+    except Exception:
+        pass
+    return ""
+
+
+def validate_user_by_screen_name_response(payload: object) -> tuple[bool, str]:
+    """
+    Validate UserByScreenName API response.
+    
+    Returns:
+        Tuple of (is_valid, error_message)
+        - If valid: (True, "")
+        - If invalid: (False, error_reason)
+    """
+    if not isinstance(payload, dict):
+        return False, "Response is not a dict"
+    
+    try:
+        data = payload.get("data", {})
+        if not isinstance(data, dict):
+            return False, "No data field"
+        
+        user_obj = data.get("user", {})
+        if not isinstance(user_obj, dict):
+            return False, "No user field"
+        
+        result_user = user_obj.get("result", {})
+        if not isinstance(result_user, dict):
+            return False, "No result field"
+        
+        typename = result_user.get("__typename", "")
+        
+        if typename == "User":
+            return True, ""
+        elif typename == "UserUnavailable":
+            reason = result_user.get("reason", "")
+            if reason == "Deactivated":
+                return False, "Cuenta desactivada"
+            elif reason == "Suspended":
+                return False, "Cuenta suspendida"
+            else:
+                return False, f"Cuenta no disponible ({reason})"
+        elif typename == "UserNotFound":
+            return False, "Cuenta no existe"
+        else:
+            return False, f"Tipo inválido: {typename}"
+    
+    except Exception as e:
+        return False, f"Error parsing response: {e}"
+
+
 def build_profile_row_from_api_json(
     profile_url: str,
     payload: object,
 ) -> dict[str, str | int | list[str]]:
     if not isinstance(payload, dict):
         raise ValueError("UserByScreenName response is not an object")
+    
+    # Validate response
+    is_valid, error_msg = validate_user_by_screen_name_response(payload)
+    if not is_valid:
+        raise ValueError(error_msg)
+    
     result = (
         payload.get("data", {})
         if isinstance(payload.get("data"), dict)
@@ -531,8 +880,6 @@ def build_profile_row_from_api_json(
     )
     user = result.get("user", {}) if isinstance(result, dict) else {}
     result_user = user.get("result", {}) if isinstance(user, dict) else {}
-    if not isinstance(result_user, dict) or result_user.get("__typename") != "User":
-        raise ValueError("UserByScreenName did not return a User")
 
     core = result_user.get("core", {})
     legacy = result_user.get("legacy", {})
@@ -832,6 +1179,148 @@ def build_profile_row_from_html(
         "urls": urls,
         "detected_handle": extract_handle_from_banner(banner),
     }
+
+
+def save_following_profiles_directly(
+    db_config: dict[str, object],
+    profiles: list[dict[str, str | int | list]],
+    ensure_db: bool = True,
+) -> int:
+    """
+    Save profiles extracted directly from Following API to database.
+    
+    These profiles already have all the data (title, description, urls)
+    extracted from the API response. No additional UserByScreenName calls needed!
+    
+    Args:
+        db_config: Database configuration
+        profiles: List of profile dicts from extract_profiles_from_following_response()
+        ensure_db: Whether to ensure database exists first
+    
+    Returns:
+        Number of profiles saved
+    """
+    # Deduplicate by URL
+    unique_rows: dict[str, dict[str, str | int | list]] = {}
+    for item in profiles:
+        key = str(item.get("url", "")).strip().lower()
+        if key:
+            unique_rows[key] = item
+    
+    profiles = list(unique_rows.values())
+    profile_count = len(profiles)
+    
+    if profile_count == 0:
+        return 0
+    
+    if ensure_db:
+        ensure_scan_db(db_config)
+    
+    conn = _mysql_connection(db_config, with_database=True)
+    cursor = conn.cursor()
+    generated_at = datetime.now()
+    table_sql = _mysql_identifier(MYSQL_PROFILE_TABLE)
+    vtuber_table_sql = _mysql_identifier(MYSQL_VTUBER_TABLE)
+    
+    # Delete existing profiles for these URLs
+    profile_urls = [str(item.get("url", "")).strip().lower() for item in profiles if str(item.get("url", "")).strip()]
+    if profile_urls:
+        placeholders = ", ".join("%s" for _ in profile_urls)
+        cursor.execute(
+            f"DELETE FROM {table_sql} WHERE LOWER(profile_url) IN ({placeholders})",
+            profile_urls,
+        )
+        cursor.execute(
+            f"""
+            DELETE FROM {_mysql_identifier(MYSQL_DONATION_TABLE)}
+            WHERE LOWER(profile_url) IN ({placeholders})
+            """,
+            profile_urls,
+        )
+    
+    # Insert profiles
+    cursor.executemany(
+        f"""
+        INSERT INTO {table_sql} (
+            generated_at,
+            profile_url,
+            title,
+            description,
+            urls,
+            artist_category,
+            artist_categories,
+            content_rating
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        [
+            (
+                generated_at,
+                str(item.get("url", "")),
+                str(item.get("title", "")),
+                str(item.get("description", "")),
+                json.dumps(normalize_urls(item.get("urls", [])), ensure_ascii=False),
+                str(item.get("artist_category", "general") or "general"),
+                json.dumps(
+                    normalize_string_list(item.get("artist_categories", [])) or ["general"],
+                    ensure_ascii=False,
+                ),
+                str(item.get("content_rating", "unknown") or "unknown"),
+            )
+            for item in profiles
+        ],
+    )
+    conn.commit()
+    
+    # Handle vtuber profiles
+    vtuber_rows: list[tuple[str, str, str, str, str, str]] = []
+    for item in profiles:
+        profile_url = str(item.get("url", ""))
+        categories = normalize_string_list(item.get("artist_categories", []))
+        if not categories:
+            categories = [str(item.get("artist_category", "general") or "general")]
+        
+        if "vtuber" in {value.lower() for value in categories}:
+            metadata = item.get("vtuber_metadata", {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            vtuber_rows.append(
+                (
+                    profile_url,
+                    str(item.get("title", "")),
+                    str(metadata.get("papa", "") or ""),
+                    str(metadata.get("mama", "") or ""),
+                    str(metadata.get("agencia", "") or ""),
+                    str(metadata.get("grupo", "") or ""),
+                )
+            )
+    
+    if vtuber_rows:
+        cursor.executemany(
+            f"""
+            INSERT INTO {vtuber_table_sql} (
+                perfil,
+                name,
+                papa,
+                mama,
+                agencia,
+                grupo
+            )
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                name = VALUES(name),
+                papa = VALUES(papa),
+                mama = VALUES(mama),
+                agencia = VALUES(agencia),
+                grupo = VALUES(grupo)
+            """,
+            vtuber_rows,
+        )
+        conn.commit()
+    
+    cursor.close()
+    conn.close()
+    return profile_count
 
 
 def save_scan_results(

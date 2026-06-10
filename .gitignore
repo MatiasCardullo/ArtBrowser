@@ -4,6 +4,7 @@
 /scan_results
 *.json
 *.har
+test_*.py
 .env
 artbrowser_crash.log
 scan_debug.log

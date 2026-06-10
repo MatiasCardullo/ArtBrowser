@@ -34,6 +34,12 @@ from scanner import (
     get_success_profile_urls,
     is_ignored_profile_url,
     load_user_by_screen_name_template,
+    load_following_api_template,
+    fetch_following_profiles_from_api,
+    extract_user_id_from_profile_response,
+    extract_profiles_from_following_response,
+    validate_user_by_screen_name_response,
+    save_following_profiles_directly,
     save_scan_results,
 )
 from widgets import ScanTab, SettingsTab, WebEngineView
@@ -291,6 +297,112 @@ class BrowserWindow(QMainWindow):
         save_settings(BrowserWindow.app_settings)
         self.start_following_scan(self.scan_settings_tab)
 
+    def _extract_user_handle_from_url(self, url: str) -> str | None:
+        """Extract user handle from x.com/{handle}/following URL."""
+        try:
+            match = re.search(r"x\.com/([A-Za-z0-9_]{1,15})/following", url, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        except Exception:
+            pass
+        return None
+
+    def _fetch_profiles_from_graphql_api(self, following_url: str, max_profiles: int) -> list[dict[str, str]]:
+        """
+        Try fetching profiles from GraphQL Following API when HTML parsing fails.
+        Returns list of profile dicts, or empty list on error.
+        """
+        try:
+            # Extract user handle
+            user_handle = self._extract_user_handle_from_url(following_url)
+            if not user_handle:
+                self._enqueue_scan_log(f"No se pudo extraer handle de la URL: {following_url}")
+                return []
+            
+            self._enqueue_scan_log(f"Intentando API GraphQL para usuario: {user_handle}")
+            
+            # Get user ID from UserByScreenName API
+            user_id = self._get_user_id_from_handle(user_handle)
+            if not user_id:
+                self._enqueue_scan_log(f"No se pudo obtener user ID para: {user_handle}")
+                return []
+            
+            self._enqueue_scan_log(f"User ID obtenido: {user_id[:16]}...")
+            
+            # Fetch profiles from Following API
+            profiles, _ = fetch_following_profiles_from_api(
+                self.scan_following_api_template,
+                user_id,
+                count=min(100, max_profiles),
+                cursor=None,
+            )
+            
+            if not profiles:
+                self._enqueue_scan_log("No se obtuvieron perfiles del API GraphQL")
+                return []
+            
+            # Save profiles directly to SQL (they already have all the data!)
+            self._enqueue_scan_log(f"Guardando {len(profiles)} perfiles directamente en SQL...")
+            try:
+                saved_count = save_following_profiles_directly(
+                    self._scan_db_config(),
+                    profiles,
+                    ensure_db=True,
+                )
+                self._enqueue_scan_log(f"✓ {saved_count} perfiles guardados en SQL")
+                self.scan_saved_count = saved_count
+            except Exception as exc:
+                self._enqueue_scan_log(f"Error guardando en SQL: {exc}")
+            
+            self._enqueue_scan_log(f"✓ API GraphQL: {len(profiles)} perfiles obtenidos y guardados")
+            return profiles
+        
+        except Exception as e:
+            self._enqueue_scan_log(f"Error en API GraphQL: {e}")
+            return []
+
+    def _get_user_id_from_handle(self, user_handle: str) -> str:
+        """Get user ID from Twitter handle using UserByScreenName API (synchronously)."""
+        try:
+            from urllib.request import Request, urlopen
+            from urllib.parse import urlencode
+            import json
+            
+            path = str(self.scan_api_template.get("path", ""))
+            features = str(self.scan_api_template.get("features", "{}"))
+            field_toggles = str(self.scan_api_template.get("field_toggles", "{}"))
+            headers_dict = dict(self.scan_api_template.get("headers", {}))
+            
+            variables = {"screen_name": user_handle}
+            url = f"https://x.com{path}"
+            params = {
+                "variables": json.dumps(variables, separators=(",", ":")),
+                "features": features,
+                "fieldToggles": field_toggles,
+            }
+            full_url = url + "?" + urlencode(params)
+            
+            req = Request(full_url)
+            headers_dict.update({
+                "content-type": "application/json",
+                "accept": "*/*",
+                "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            })
+            
+            for header_name, header_value in headers_dict.items():
+                req.add_header(header_name, str(header_value))
+            
+            response = urlopen(req, timeout=10)
+            response_data = response.read().decode('utf-8')
+            data = json.loads(response_data)
+            
+            user_id = extract_user_id_from_profile_response(data)
+            return user_id if user_id else ""
+        
+        except Exception as e:
+            self._enqueue_scan_log(f"Error obteniendo user ID: {e}")
+            return ""
+
     def start_following_scan(self, settings_tab: SettingsTab) -> None:
         if self.scan_running:
             return
@@ -322,6 +434,7 @@ class BrowserWindow(QMainWindow):
         try:
             ensure_scan_db(self._scan_db_config())
             self.scan_api_template = load_user_by_screen_name_template(BASE_DIR)
+            self.scan_following_api_template = load_following_api_template(BASE_DIR)
         except Exception as exc:
             self._on_scan_failed(f"Error inicializando escaneo: {exc}")
             return
@@ -445,53 +558,83 @@ class BrowserWindow(QMainWindow):
                 pass
             if not self.scan_running:
                 return
-            if not ok:
-                self._enqueue_scan_log(
-                    "No se pudo cargar la pestaña, usando HTML vacio para detectar perfiles"
-                )
-                collect_candidates_round(1)
-                return
-            self._enqueue_scan_log("Pagina cargada, esperando lista de perfiles en el DOM")
-
-            def wait_for_user_cells(retries_left: int) -> None:
-                script = """
-                (() => {
-                    const nodes = Array.from(document.querySelectorAll('[aria-label]'));
-                    const timeline = nodes.find((node) => {
-                        const aria = node.getAttribute('aria-label') || '';
-                        return (aria.includes('Cronología') || aria.includes('Timeline'))
-                            && (aria.includes('Siguiendo') || aria.includes('Following'));
-                    });
-                    if (!timeline) return 0;
-                    return timeline.querySelectorAll('[data-testid="UserCell"]').length;
-                })()
-                """
-
-                def on_count(result: object) -> None:
-                    try:
-                        count = int(result)
-                    except (TypeError, ValueError):
-                        count = 0
-                    if not self.scan_running:
-                        return
-                    if count > 0:
-                        self._enqueue_scan_log(
-                            f"Perfiles visibles detectados: {count}. Iniciando recoleccion incremental"
-                        )
-                        collect_candidates_round(1)
-                        return
-                    if retries_left > 0:
-                        web_view.page().runJavaScript(
-                            "window.scrollBy(0, Math.max(400, window.innerHeight * 0.6));"
-                        )
-                        QTimer.singleShot(900, lambda: wait_for_user_cells(retries_left - 1))
-                        return
-                    self._enqueue_scan_log("No aparecieron UserCell a tiempo, iniciando con HTML actual")
+            
+            # PRIORITY: Use Following API GraphQL (single call, no ratelimit per-profile issues)
+            # Extract handle from URL, get user_id, fetch all profiles at once
+            self._enqueue_scan_log("Pagina cargada. Obteniendo perfiles desde API GraphQL Following...")
+            
+            user_handle = self._extract_user_handle_from_url(scan_url)
+            if not user_handle:
+                self._enqueue_scan_log(f"Error: No se pudo extraer handle de {scan_url}")
+                if ok:
+                    # Fallback to HTML parsing if we loaded the page
                     collect_candidates_round(1)
-
-                web_view.page().runJavaScript(script, on_count)
-
-            wait_for_user_cells(8)
+                else:
+                    self._on_scan_failed("No se pudo cargar la página ni extraer handle")
+                return
+            
+            # Get user ID (single UserByScreenName call, safe)
+            self._enqueue_scan_log(f"Obteniendo user ID para @{user_handle}...")
+            user_id = self._get_user_id_from_handle(user_handle)
+            if not user_id:
+                self._enqueue_scan_log(f"Error: No se pudo obtener user ID para @{user_handle}")
+                if ok:
+                    # Fallback to HTML parsing
+                    collect_candidates_round(1)
+                else:
+                    self._on_scan_failed("No se pudo obtener user ID")
+                return
+            
+            # Fetch all profiles from Following API GraphQL (single call, complete data)
+            self._enqueue_scan_log(f"Obteniendo lista de seguidos desde Following API...")
+            try:
+                profiles, _ = fetch_following_profiles_from_api(
+                    self.scan_following_api_template,
+                    user_id,
+                    count=max_profiles,
+                    cursor=None,
+                )
+                
+                if not profiles:
+                    self._enqueue_scan_log("Following API sin resultados. Intentando HTML parsing...")
+                    if ok:
+                        collect_candidates_round(1)
+                    else:
+                        self._on_scan_failed("No se obtuvieron perfiles del API")
+                    return
+                
+                self._enqueue_scan_log(f"✓ Following API: {len(profiles)} perfiles obtenidos")
+                
+                # Save profiles directly to SQL (ya tienen title, description, URLs, counts)
+                self._enqueue_scan_log(f"Guardando perfiles directamente en SQL...")
+                try:
+                    saved_count = save_following_profiles_directly(
+                        self._scan_db_config(),
+                        profiles,
+                        ensure_db=True,
+                    )
+                    self.scan_saved_count = saved_count
+                    self._enqueue_scan_log(f"✓ {saved_count} perfiles guardados en SQL")
+                except Exception as exc:
+                    self._enqueue_scan_log(f"Error guardando en SQL: {exc}")
+                    return
+                
+                # API-sourced profiles are already complete, no workers needed!
+                web_view.stop()
+                self._on_scan_finished(
+                    {
+                        "profiles_found": self.scan_saved_count,
+                        "db": self._scan_db_label(),
+                    }
+                )
+                
+            except Exception as exc:
+                self._enqueue_scan_log(f"Error en Following API: {exc}")
+                if ok:
+                    # Fallback to HTML parsing
+                    collect_candidates_round(1)
+                else:
+                    self._on_scan_failed(f"Error en Following API: {exc}")
 
         web_view.loadFinished.connect(on_load_finished)
 
@@ -777,10 +920,11 @@ class BrowserWindow(QMainWindow):
             payload = json.loads(raw)
             row = build_profile_row_from_api_json(profile_url, payload)
         except Exception as exc:
+            error_reason = str(exc).strip()
             self._enqueue_scan_log(
-                f"Worker {worker_idx + 1}: UserByScreenName invalido: {exc}"
+                f"Worker {worker_idx + 1}: UserByScreenName invalido: {error_reason}"
             )
-            self._skip_worker_profile(worker_idx, profile_url, "UserByScreenName invalido")
+            self._skip_worker_profile(worker_idx, profile_url, f"UserByScreenName ({error_reason})")
             return
 
         expected_handle = profile_url.rstrip("/").rsplit("/", 1)[-1].lower()
