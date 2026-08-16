@@ -5,6 +5,7 @@ import re
 import time
 from datetime import datetime
 from html import escape
+from collections.abc import Callable
 from urllib.parse import urlencode
 
 from PyQt6.QtCore import QTimer, QUrl
@@ -24,6 +25,7 @@ from config import (
 from scanner import (
     build_profile_row_from_html,
     build_profile_row_from_api_json,
+    compare_profile_sources,
     ensure_scan_db,
     extract_handles_from_description,
     extract_link_page_content,
@@ -38,6 +40,8 @@ from scanner import (
     fetch_following_profiles_from_api,
     extract_user_id_from_profile_response,
     extract_profiles_from_following_response,
+    get_saved_profile_urls,
+    normalize_profile_handle,
     validate_user_by_screen_name_response,
     save_following_profiles_directly,
     save_scan_results,
@@ -90,6 +94,7 @@ class BrowserWindow(QMainWindow):
         self.scan_api_view: WebEngineView | None = None
         self.scan_api_ready = False
         self.scan_api_queue: list[tuple[int, str]] = []
+        self.scan_superficial_state: dict[str, object] | None = None
 
         BrowserWindow.open_windows.append(self)
         self._ensure_cookie_capture()
@@ -129,15 +134,18 @@ class BrowserWindow(QMainWindow):
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
 
-        back_action = QAction("Atrás", self)
+        back_action = QAction("←", self)
+        back_action.setToolTip("Atrás")
         back_action.triggered.connect(self._go_back)
         toolbar.addAction(back_action)
 
-        forward_action = QAction("Adelante", self)
+        forward_action = QAction("→", self)
+        forward_action.setToolTip("Adelante")
         forward_action.triggered.connect(self._go_forward)
         toolbar.addAction(forward_action)
 
-        reload_action = QAction("Recargar", self)
+        reload_action = QAction("⟳", self)
+        reload_action.setToolTip("Recargar")
         reload_action.triggered.connect(self._reload_current)
         toolbar.addAction(reload_action)
 
@@ -147,28 +155,26 @@ class BrowserWindow(QMainWindow):
         self.url_bar.returnPressed.connect(self._load_url_from_bar)
         toolbar.addWidget(self.url_bar)
 
-        new_tab_action = QAction("Nueva pestaña", self)
-        new_tab_action.triggered.connect(lambda: self.add_tab(DEFAULT_URL))
-        toolbar.addAction(new_tab_action)
-
-        new_window_action = QAction("Nueva ventana", self)
-        new_window_action.triggered.connect(self._open_new_window)
-        toolbar.addAction(new_window_action)
-
-        settings_action = QAction("Configuracion", self)
-        settings_action.triggered.connect(self.open_settings_tab)
-        toolbar.addAction(settings_action)
-
-        save_page_action = QAction("Guardar pagina", self)
+        save_page_action = QAction("💾", self)
+        save_page_action.setToolTip("Guardar página")
         save_page_action.triggered.connect(self._save_current_page)
         toolbar.addAction(save_page_action)
+
+        settings_action = QAction("⚙", self)
+        settings_action.setToolTip("Configuración")
+        settings_action.triggered.connect(self.open_settings_tab)
+        toolbar.addAction(settings_action)
 
     def _create_tabs(self) -> None:
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
         self.tabs.setTabsClosable(True)
+        self.tabs.setMovable(True)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.tabs.tabCloseRequested.connect(self._on_tab_close_requested)
+        self.tabs.tabBarClicked.connect(self._on_tab_bar_clicked)
+        self.tabs.tabBar().tabMoved.connect(self._on_tab_moved)
+        self._setup_plus_tab()
         container = QWidget()
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -176,13 +182,33 @@ class BrowserWindow(QMainWindow):
         container.setLayout(layout)
         self.setCentralWidget(container)
 
+    def _setup_plus_tab(self) -> None:
+        self.plus_widget = QWidget()
+        index = self.tabs.addTab(self.plus_widget, "+")
+        bar = self.tabs.tabBar()
+        bar.setTabButton(index, bar.ButtonPosition.RightSide, None)
+        bar.setTabButton(index, bar.ButtonPosition.LeftSide, None)
+
+    def _on_tab_bar_clicked(self, index: int) -> None:
+        if self.tabs.widget(index) is self.plus_widget:
+            self.add_tab(DEFAULT_URL)
+
+    def _on_tab_moved(self, from_index: int, to_index: int) -> None:
+        plus_index = self.tabs.indexOf(self.plus_widget)
+        last = self.tabs.count() - 1
+        if plus_index != last:
+            self.tabs.tabBar().moveTab(plus_index, last)
+
     def _on_tab_changed(self, index: int) -> None:
         _ = index
         view = self.current_view()
         self.url_bar.setText(view.url().toString() if view else "artbrowser://settings")
 
     def _on_tab_close_requested(self, index: int) -> None:
-        if self.tabs.count() == 1:
+        widget = self.tabs.widget(index)
+        if widget is self.plus_widget:
+            return
+        if self.tabs.count() <= 2:
             self.close()
             return
         self.tabs.removeTab(index)
@@ -213,7 +239,8 @@ class BrowserWindow(QMainWindow):
         view.titleChanged.connect(
             lambda title: self.tabs.setTabText(self.tabs.indexOf(view), title)
         )
-        index = self.tabs.addTab(view, "Nueva pestaña")
+        insert_at = self.tabs.indexOf(self.plus_widget)
+        index = self.tabs.insertTab(insert_at, view, "Nueva pestaña")
         self.tabs.setCurrentIndex(index)
         view.iconChanged.connect(lambda icon: self.tabs.setTabIcon(index, icon))
         return view
@@ -261,6 +288,8 @@ class BrowserWindow(QMainWindow):
             BrowserWindow.app_settings,
             self._start_scan_from_settings,
             self._save_scan_settings,
+            self._compare_lists_from_settings,
+            self._compare_lists_against_sql_from_settings,
         )
         self.scan_settings_tab = settings_widget
         index = self.tabs.addTab(settings_widget, "Configuracion")
@@ -281,11 +310,9 @@ class BrowserWindow(QMainWindow):
             "scan_following_max_scroll_rounds",
             "scan_following_max_profiles",
             "scan_skip_already_ok",
-            "mysql_host",
-            "mysql_port",
-            "mysql_database",
-            "mysql_user",
-            "mysql_password",
+            "scan_target_kind",
+            "scan_shallow_mode",
+            "scan_compare_urls",
         ):
             if key in values:
                 BrowserWindow.app_settings[key] = values[key]
@@ -295,7 +322,65 @@ class BrowserWindow(QMainWindow):
             return
         self._apply_scan_settings(values)
         save_settings(BrowserWindow.app_settings)
+        target_kind = str(values.get("scan_target_kind", "followings")).strip().lower()
+        shallow_mode = self._scan_setting_bool("scan_shallow_mode", True)
+        source_url = str(values.get("following_scan_url", DEFAULT_URL)).strip()
+        if shallow_mode:
+            self.start_superficial_scan(
+                self.scan_settings_tab,
+                source_url=source_url,
+                target_kind=target_kind,
+            )
+            return
+        if target_kind == "list":
+            self._on_scan_failed("El modo profundo solo esta implementado para followings")
+            return
         self.start_following_scan(self.scan_settings_tab)
+
+    def _compare_lists_from_settings(self, values: dict[str, str | bool | int | float]) -> None:
+        if self.scan_settings_tab is None:
+            return
+        self._apply_scan_settings(values)
+        save_settings(BrowserWindow.app_settings)
+        urls = self._normalize_compare_input_urls(values)
+        if len(urls) < 2:
+            self.scan_settings_tab.status_label.setText("Agrega al menos 2 URLs de listas para comparar")
+            return
+        self.start_list_comparison(self.scan_settings_tab, urls)
+
+    def _compare_lists_against_sql_from_settings(
+        self, values: dict[str, str | bool | int | float]
+    ) -> None:
+        if self.scan_settings_tab is None:
+            return
+        self._apply_scan_settings(values)
+        save_settings(BrowserWindow.app_settings)
+        urls = self._normalize_compare_input_urls(values)
+        if not urls:
+            self.scan_settings_tab.status_label.setText("Agrega al menos 1 URL para comparar con SQL")
+            return
+        self.start_sql_comparison(self.scan_settings_tab, urls)
+
+    def _normalize_compare_input_urls(
+        self, values: dict[str, str | bool | int | float]
+    ) -> list[str]:
+        raw_urls = str(values.get("scan_compare_urls", "")).splitlines()
+        urls: list[str] = []
+        seen: set[str] = set()
+        for raw in raw_urls:
+            url = str(raw).strip()
+            if not url:
+                continue
+            qurl = QUrl(url)
+            if not qurl.scheme():
+                qurl.setScheme("https")
+            normalized = qurl.toString().strip()
+            lower = normalized.lower()
+            if lower in seen:
+                continue
+            seen.add(lower)
+            urls.append(normalized)
+        return urls
 
     def _extract_user_handle_from_url(self, url: str) -> str | None:
         """Extract user handle from x.com/{handle}/following URL."""
@@ -402,6 +487,500 @@ class BrowserWindow(QMainWindow):
         except Exception as e:
             self._enqueue_scan_log(f"Error obteniendo user ID: {e}")
             return ""
+
+    def start_superficial_scan(
+        self,
+        settings_tab: SettingsTab,
+        source_url: str,
+        target_kind: str,
+    ) -> None:
+        if self.scan_running:
+            return
+
+        qurl = QUrl(str(source_url).strip())
+        if not qurl.scheme():
+            qurl.setScheme("https")
+        scan_url = qurl.toString().strip()
+        if not scan_url:
+            self._on_scan_failed("URL vacia")
+            return
+
+        settings_tab.set_scan_running(True)
+        self.statusBar().showMessage("Escaneo superficial iniciado", 3000)
+        scan_tab = self._open_scan_tab()
+        scan_tab.set_running(True)
+        scan_tab.clear_workers()
+        scan_tab.set_active_workers(0)
+
+        self.scan_running = True
+        self.scan_following_url = scan_url
+        self.scan_pending_candidates = []
+        self.scan_results = []
+        self.scan_saved_count = 0
+        self.scan_total_candidates = 0
+        self.scan_worker_states = [None, None, None, None]
+        self.scan_url_resolve_cache = {}
+        self.scan_opened_link_urls = set()
+        self.scan_api_ready = False
+        self.scan_api_queue = []
+        self.scan_superficial_state = {
+            "sources": [
+                {
+                    "url": scan_url,
+                    "kind": target_kind,
+                    "label": scan_url,
+                }
+            ],
+            "index": 0,
+            "compare_mode": False,
+            "save_results": True,
+            "max_rounds": self._scan_setting_int(
+                "scan_following_max_scroll_rounds", SCAN_FOLLOWING_MAX_SCROLL_ROUNDS, minimum=1
+            ),
+            "max_profiles": self._scan_setting_int(
+                "scan_following_max_profiles", SCAN_FOLLOWING_MAX_PROFILES, minimum=1
+            ),
+            "current_candidates": [],
+            "current_seen": set(),
+            "current_round": 1,
+            "current_source": None,
+            "compare_sources": {},
+        }
+        try:
+            ensure_scan_db(self._scan_db_config())
+        except Exception as exc:
+            self._on_scan_failed(f"Error inicializando base de datos: {exc}")
+            return
+
+        web_view = scan_tab.web_view
+        try:
+            web_view.loadFinished.disconnect(self._on_superficial_load_finished)
+        except Exception:
+            pass
+        web_view.loadFinished.connect(self._on_superficial_load_finished)
+        self._enqueue_scan_log(f"Cargando fuente superficial: {scan_url}")
+        self._superficial_load_current_source()
+
+    def start_list_comparison(
+        self,
+        settings_tab: SettingsTab,
+        source_urls: list[str],
+    ) -> None:
+        if self.scan_running:
+            return
+        normalized_sources: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for idx, raw_url in enumerate(source_urls, 1):
+            qurl = QUrl(str(raw_url).strip())
+            if not qurl.scheme():
+                qurl.setScheme("https")
+            url = qurl.toString().strip()
+            if not url:
+                continue
+            lower = url.lower()
+            if lower in seen:
+                continue
+            seen.add(lower)
+            normalized_sources.append(
+                {
+                    "url": url,
+                    "kind": "list",
+                    "label": f"Lista {idx}",
+                }
+            )
+        if len(normalized_sources) < 2:
+            settings_tab.status_label.setText("Agrega al menos 2 URLs de listas para comparar")
+            return
+
+        settings_tab.set_scan_running(True)
+        self.statusBar().showMessage("Comparacion de listas iniciada", 3000)
+        scan_tab = self._open_scan_tab()
+        scan_tab.set_running(True)
+        scan_tab.clear_workers()
+        scan_tab.set_active_workers(0)
+
+        self.scan_running = True
+        self.scan_following_url = normalized_sources[0]["url"]
+        self.scan_pending_candidates = []
+        self.scan_results = []
+        self.scan_saved_count = 0
+        self.scan_total_candidates = 0
+        self.scan_worker_states = [None, None, None, None]
+        self.scan_url_resolve_cache = {}
+        self.scan_opened_link_urls = set()
+        self.scan_api_ready = False
+        self.scan_api_queue = []
+        self.scan_superficial_state = {
+            "sources": normalized_sources,
+            "index": 0,
+            "compare_mode": True,
+            "save_results": False,
+            "max_rounds": self._scan_setting_int(
+                "scan_following_max_scroll_rounds", SCAN_FOLLOWING_MAX_SCROLL_ROUNDS, minimum=1
+            ),
+            "max_profiles": self._scan_setting_int(
+                "scan_following_max_profiles", SCAN_FOLLOWING_MAX_PROFILES, minimum=1
+            ),
+            "current_candidates": [],
+            "current_seen": set(),
+            "current_round": 1,
+            "current_source": None,
+            "compare_sources": {},
+        }
+
+        web_view = scan_tab.web_view
+        try:
+            web_view.loadFinished.disconnect(self._on_superficial_load_finished)
+        except Exception:
+            pass
+        web_view.loadFinished.connect(self._on_superficial_load_finished)
+        self._enqueue_scan_log("Comparando listas superficiales...")
+        self._superficial_load_current_source()
+
+    def start_sql_comparison(
+        self,
+        settings_tab: SettingsTab,
+        source_urls: list[str],
+    ) -> None:
+        if self.scan_running:
+            return
+        if not source_urls:
+            settings_tab.status_label.setText("Agrega al menos 1 URL para comparar con SQL")
+            return
+
+        settings_tab.set_scan_running(True)
+        self.statusBar().showMessage("Comparacion con SQL iniciada", 3000)
+        scan_tab = self._open_scan_tab()
+        scan_tab.set_running(True)
+        scan_tab.clear_workers()
+        scan_tab.set_active_workers(0)
+
+        try:
+            sql_urls = get_saved_profile_urls(self._scan_db_config())
+        except Exception as exc:
+            settings_tab.set_scan_running(False)
+            self._on_scan_failed(f"Error leyendo SQL: {exc}")
+            return
+
+        self.scan_running = True
+        report = compare_profile_sources(
+            {
+                "SQL": sql_urls,
+                "Entrada": source_urls,
+            }
+        )
+        self.scan_superficial_state = None
+        self.scan_results = []
+        self.scan_saved_count = 0
+        self.scan_total_candidates = 0
+        self._on_scan_finished(
+            {
+                "profiles_found": len(source_urls),
+                "db": "comparacion con SQL",
+                "report_html": self._build_compare_report_html(report),
+            }
+        )
+
+    def _superficial_state(self) -> dict[str, object] | None:
+        state = self.scan_superficial_state
+        if isinstance(state, dict):
+            return state
+        return None
+
+    def _superficial_load_current_source(self) -> None:
+        state = self._superficial_state()
+        if not self.scan_running or self.scan_tab is None or state is None:
+            return
+        sources = state.get("sources")
+        if not isinstance(sources, list):
+            self._finish_superficial_run()
+            return
+        index = int(state.get("index", 0))
+        if index >= len(sources):
+            self._finish_superficial_run()
+            return
+        source = sources[index]
+        if not isinstance(source, dict):
+            state["index"] = index + 1
+            self._superficial_load_current_source()
+            return
+        state["current_source"] = source
+        state["current_candidates"] = []
+        state["current_seen"] = set()
+        state["current_round"] = 1
+        source_url = str(source.get("url", "")).strip()
+        source_label = str(source.get("label", source_url)).strip()
+        self._enqueue_scan_log(f"Fuente {index + 1}/{len(sources)}: {source_label}")
+        self.scan_tab.web_view.setUrl(QUrl(source_url))
+
+    def _click_list_members_tab(self, on_done: Callable[[bool], None] | None = None) -> None:
+        if self.scan_tab is None:
+            if on_done is not None:
+                on_done(False)
+            return
+        script = """
+        (() => {
+            const membersLinks = Array.from(document.querySelectorAll('a[href*="/members"]'));
+            for (const link of membersLinks) {
+                const href = (link.getAttribute('href') || '').toLowerCase();
+                const text = ((link.innerText || link.textContent || '') + ' ' + (link.getAttribute('aria-label') || '')).toLowerCase();
+                if (href.includes('/members') || text.includes('members') || text.includes('miembros')) {
+                    if (typeof link.click === 'function') {
+                        link.click();
+                        return true;
+                    }
+                }
+            }
+            const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+            for (const node of buttons) {
+                const text = ((node.innerText || node.textContent || '') + ' ' + (node.getAttribute('aria-label') || '')).trim().toLowerCase();
+                if (!text) continue;
+                if (text.includes('members') || text.includes('miembros')) {
+                    if (typeof node.click === 'function') {
+                        node.click();
+                        return true;
+                    }
+                }
+            }
+            return false;
+        })()
+        """
+        self.scan_tab.web_view.page().runJavaScript(
+            script,
+            lambda data: on_done(bool(data)) if on_done is not None else None,
+        )
+
+    def _after_list_members_click(self, clicked: bool) -> None:
+        if not clicked:
+            self._enqueue_scan_log("No se encontro el enlace de miembros en la lista")
+            self._superficial_finish_current_source()
+            return
+        QTimer.singleShot(900, self._superficial_wait_for_members_view)
+
+    def _scroll_members_modal(self) -> None:
+        if self.scan_tab is None:
+            return
+        script = """
+        (() => {
+            const roots = Array.from(document.querySelectorAll('[aria-label*="Miembros de la lista"], [aria-label*="Members of the list"], [aria-labelledby*="modal-header"], [role="dialog"]'));
+            const candidates = [];
+            for (const root of roots) {
+                candidates.push(root);
+                candidates.push(...Array.from(root.querySelectorAll('*')));
+            }
+            const scrollables = candidates.filter((node) => {
+                if (!node || !node.scrollHeight || !node.clientHeight) return false;
+                const style = window.getComputedStyle(node);
+                const overflowY = style.overflowY || style.overflow;
+                return node.scrollHeight > node.clientHeight + 20 && overflowY !== 'visible';
+            });
+            const target = scrollables[0] || roots[0] || document.scrollingElement || document.documentElement;
+            if (target && typeof target.scrollBy === 'function') {
+                target.scrollBy(0, Math.max(600, target.clientHeight * 0.9));
+                return true;
+            }
+            if (target && typeof target.scrollTop === 'number') {
+                target.scrollTop += Math.max(600, target.clientHeight * 0.9);
+                return true;
+            }
+            window.scrollBy(0, Math.max(600, window.innerHeight * 0.9));
+            return true;
+        })()
+        """
+        self.scan_tab.web_view.page().runJavaScript(script)
+
+    def _on_superficial_load_finished(self, ok: bool) -> None:
+        state = self._superficial_state()
+        if not self.scan_running or self.scan_tab is None or state is None:
+            return
+        source = state.get("current_source")
+        if not isinstance(source, dict):
+            return
+        if not ok:
+            self._enqueue_scan_log(
+                f"Fuente superficial fallida: {str(source.get('url', ''))}"
+            )
+            self._superficial_finish_current_source()
+            return
+        kind = str(source.get("kind", "followings")).strip().lower()
+        page_url = self.scan_tab.web_view.url().toString().lower()
+        if kind == "list" and "/members" not in page_url:
+            self._click_list_members_tab(self._after_list_members_click)
+            return
+        if kind == "list":
+            QTimer.singleShot(500, self._superficial_wait_for_members_view)
+            return
+        QTimer.singleShot(700, lambda: self._superficial_collect_round(1))
+
+    def _superficial_wait_for_members_view(self) -> None:
+        if self.scan_tab is None:
+            return
+        current_url = self.scan_tab.web_view.url().toString().lower()
+        state = self._superficial_state()
+        if not self.scan_running or state is None:
+            return
+        source = state.get("current_source")
+        if not isinstance(source, dict):
+            return
+        kind = str(source.get("kind", "followings")).strip().lower()
+        if kind == "list" and "/members" not in current_url:
+            QTimer.singleShot(600, self._superficial_wait_for_members_view)
+            return
+        QTimer.singleShot(500, lambda: self._superficial_collect_round(1))
+
+    def _superficial_collect_round(self, round_idx: int) -> None:
+        state = self._superficial_state()
+        if not self.scan_running or self.scan_tab is None or state is None:
+            return
+        source = state.get("current_source")
+        if not isinstance(source, dict):
+            return
+        max_rounds = int(state.get("max_rounds", 1))
+        max_profiles = int(state.get("max_profiles", 1))
+        current_candidates = state.get("current_candidates")
+        if not isinstance(current_candidates, list):
+            current_candidates = []
+            state["current_candidates"] = current_candidates
+        if len(current_candidates) >= max_profiles or round_idx > max_rounds:
+            self._superficial_finish_current_source()
+            return
+        self.scan_tab.web_view.page().toHtml(
+            lambda html: self._on_superficial_html(round_idx, html or "")
+        )
+
+    def _on_superficial_html(self, round_idx: int, html: str) -> None:
+        state = self._superficial_state()
+        if not self.scan_running or self.scan_tab is None or state is None:
+            return
+        source = state.get("current_source")
+        if not isinstance(source, dict):
+            return
+        source_url = str(source.get("url", "")).strip()
+        current_candidates = state.get("current_candidates")
+        current_seen = state.get("current_seen")
+        if not isinstance(current_candidates, list) or not isinstance(current_seen, set):
+            return
+        candidates = extract_profile_candidates(source_url, html)
+        new_in_round = 0
+        max_profiles = int(state.get("max_profiles", 1))
+        for candidate in candidates:
+            profile_url = str(candidate.get("url", "")).strip()
+            if not profile_url:
+                continue
+            lower = profile_url.lower()
+            if lower in current_seen:
+                continue
+            current_seen.add(lower)
+            current_candidates.append(candidate)
+            new_in_round += 1
+            if len(current_candidates) >= max_profiles:
+                break
+        source_label = str(source.get("label", source_url)).strip()
+        self._enqueue_scan_log(
+            f"{source_label} ronda {round_idx}: +{new_in_round} perfiles, total={len(current_candidates)}"
+        )
+        if len(current_candidates) >= max_profiles or round_idx >= int(state.get("max_rounds", 1)):
+            self._superficial_finish_current_source()
+            return
+        self.scan_tab.web_view.page().runJavaScript(
+            "window.__artbrowser_scroll_members_modal = true;"
+        )
+        self._scroll_members_modal()
+        QTimer.singleShot(900, lambda: self._superficial_collect_round(round_idx + 1))
+
+    def _superficial_finish_current_source(self) -> None:
+        state = self._superficial_state()
+        if not self.scan_running or self.scan_tab is None or state is None:
+            return
+        source = state.get("current_source")
+        if not isinstance(source, dict):
+            return
+        source_url = str(source.get("url", "")).strip()
+        source_label = str(source.get("label", source_url)).strip()
+        current_candidates = state.get("current_candidates")
+        if not isinstance(current_candidates, list):
+            current_candidates = []
+        rows: list[dict[str, str | int | list[str]]] = []
+        handles: list[str] = []
+        seen_handles: set[str] = set()
+        for candidate in current_candidates:
+            if not isinstance(candidate, dict):
+                continue
+            profile_url = str(candidate.get("url", "")).strip()
+            if not profile_url:
+                continue
+            handle = normalize_profile_handle(profile_url)
+            if not handle:
+                continue
+            lower = handle.lower()
+            if lower in seen_handles:
+                continue
+            seen_handles.add(lower)
+            handles.append(handle)
+            rows.append(
+                {
+                    "url": profile_url,
+                    "title": handle,
+                    "description": "",
+                    "urls": [],
+                }
+            )
+        compare_sources = state.get("compare_sources")
+        if not isinstance(compare_sources, dict):
+            compare_sources = {}
+            state["compare_sources"] = compare_sources
+        compare_sources[source_label or source_url] = handles
+        if bool(state.get("save_results", True)) and rows:
+            try:
+                saved = save_scan_results(
+                    db_config=self._scan_db_config(),
+                    rows=rows,
+                    ensure_db=False,
+                )
+                self.scan_saved_count += saved
+            except Exception as exc:
+                self._on_scan_failed(f"Error guardando escaneo superficial: {exc}")
+                return
+        self.scan_results.extend(rows)
+        self._enqueue_scan_log(
+            f"{source_label}: {len(handles)} perfiles detectados"
+        )
+        state["index"] = int(state.get("index", 0)) + 1
+        state["current_source"] = None
+        state["current_candidates"] = []
+        state["current_seen"] = set()
+        state["current_round"] = 1
+        self._superficial_load_current_source()
+
+    def _finish_superficial_run(self) -> None:
+        state = self._superficial_state()
+        compare_mode = bool(state.get("compare_mode", False)) if state else False
+        compare_sources = {}
+        if state and isinstance(state.get("compare_sources"), dict):
+            compare_sources = dict(state["compare_sources"])
+        try:
+            if self.scan_tab is not None:
+                self.scan_tab.web_view.loadFinished.disconnect(self._on_superficial_load_finished)
+        except Exception:
+            pass
+        if compare_mode:
+            report = compare_profile_sources(compare_sources)
+            total_handles = sum(len(handles) for handles in compare_sources.values())
+            self._on_scan_finished(
+                {
+                    "profiles_found": total_handles,
+                    "db": "comparacion local",
+                    "report_html": self._build_compare_report_html(report),
+                }
+            )
+        else:
+            self._on_scan_finished(
+                {
+                    "profiles_found": self.scan_saved_count,
+                    "db": self._scan_db_label(),
+                }
+            )
+        self.scan_superficial_state = None
 
     def start_following_scan(self, settings_tab: SettingsTab) -> None:
         if self.scan_running:
@@ -1119,11 +1698,18 @@ class BrowserWindow(QMainWindow):
         self.scan_url_resolve_cache = {}
         if self.scan_tab is not None:
             self.scan_tab.set_running(False)
-            self._show_scan_dashboard("Escaneo finalizado")
+            report_html = str(result.get("report_html", "") or "")
+            if report_html:
+                self.scan_tab.web_view.setHtml(
+                    report_html, QUrl("https://artbrowser.local/scan-compare")
+                )
+            else:
+                self._show_scan_dashboard("Escaneo finalizado")
             self._enqueue_scan_log(
                 f"Escaneo finalizado. Perfiles: {result.get('profiles_found', 0)}"
             )
             self._enqueue_scan_log(f"MySQL: {result.get('db', '')}")
+        self.scan_superficial_state = None
         self.statusBar().showMessage("Escaneo finalizado", 5000)
         if self.scan_settings_tab is not None:
             self.scan_settings_tab.set_scan_running(False)
@@ -1131,6 +1717,12 @@ class BrowserWindow(QMainWindow):
     def _on_scan_failed(self, error: str) -> None:
         self.scan_running = False
         self.scan_url_resolve_cache = {}
+        try:
+            if self.scan_tab is not None:
+                self.scan_tab.web_view.loadFinished.disconnect(self._on_superficial_load_finished)
+        except Exception:
+            pass
+        self.scan_superficial_state = None
         if self.scan_tab is not None:
             self.scan_tab.set_running(False)
             self._show_scan_dashboard(f"Escaneo fallido: {error}")
@@ -1253,6 +1845,97 @@ class BrowserWindow(QMainWindow):
                 </thead>
                 <tbody>{row_html}</tbody>
             </table>
+        </body>
+        </html>
+        """
+
+    def _build_compare_report_html(self, data: dict[str, object]) -> str:
+        sources = data.get("sources", {})
+        duplicates = data.get("duplicates", [])
+        unique_by_source = data.get("unique_by_source", {})
+        total_duplicates = int(data.get("total_duplicates", 0) or 0)
+
+        source_cards = ""
+        if isinstance(sources, dict):
+            for source_name, handles in sources.items():
+                if not isinstance(handles, list):
+                    continue
+                source_cards += (
+                    "<div class='card'>"
+                    f"<h3>{escape(str(source_name))}</h3>"
+                    f"<p>{len(handles)} perfiles</p>"
+                    "</div>"
+                )
+
+        duplicate_rows = ""
+        if isinstance(duplicates, list):
+            for item in duplicates:
+                if not isinstance(item, dict):
+                    continue
+                sources_text = ", ".join(str(value) for value in item.get("sources", []) if str(value).strip())
+                duplicate_rows += (
+                    "<tr>"
+                    f"<td>{escape(str(item.get('handle', '')))}</td>"
+                    f"<td>{escape(sources_text)}</td>"
+                    "</tr>"
+                )
+        if not duplicate_rows:
+            duplicate_rows = "<tr><td colspan='2'>Sin repetidos detectados.</td></tr>"
+
+        unique_sections = ""
+        if isinstance(unique_by_source, dict):
+            for source_name, handles in unique_by_source.items():
+                if not isinstance(handles, list):
+                    continue
+                chips = " ".join(
+                    f"<span class='pill'>{escape(str(handle))}</span>" for handle in handles[:80]
+                )
+                if not chips:
+                    chips = "<span class='muted'>Sin unicos</span>"
+                unique_sections += (
+                    "<div class='card'>"
+                    f"<h3>{escape(str(source_name))}</h3>"
+                    f"<div>{chips}</div>"
+                    "</div>"
+                )
+
+        if not unique_sections:
+            unique_sections = "<p class='muted'>Sin datos unicos para mostrar.</p>"
+
+        return f"""
+        <!doctype html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 20px; color: #1f2933; }}
+                h1 {{ font-size: 22px; margin: 0 0 8px; }}
+                .meta {{ margin-bottom: 16px; color: #52606d; }}
+                .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 18px; }}
+                .card {{ background: #f5f7fa; border: 1px solid #d9e2ec; border-radius: 8px; padding: 12px; }}
+                .pill {{ display: inline-block; padding: 4px 8px; margin: 0 6px 8px 0; background: #e4e7eb; border-radius: 4px; }}
+                .muted {{ color: #66788a; }}
+                table {{ width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }}
+                th, td {{ border-bottom: 1px solid #d9e2ec; padding: 8px; vertical-align: top; text-align: left; }}
+                th {{ background: #f5f7fa; position: sticky; top: 0; }}
+            </style>
+        </head>
+        <body>
+            <h1>Comparación de listas</h1>
+            <div class="meta">Repetidos: {total_duplicates}</div>
+            <div class="grid">{source_cards}</div>
+            <h2>Repetidos</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Handle</th>
+                        <th>Fuentes</th>
+                    </tr>
+                </thead>
+                <tbody>{duplicate_rows}</tbody>
+            </table>
+            <h2>Unicos por fuente</h2>
+            {unique_sections}
         </body>
         </html>
         """

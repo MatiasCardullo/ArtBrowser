@@ -321,7 +321,7 @@ def extract_profile_candidates(following_url: str, html: str) -> list[dict[str, 
         "share",
         "intent",
     }
-    owner_match = re.search(r"x\.com/([^/?#]+)/following", following_url, re.IGNORECASE)
+    owner_match = re.search(r"x\.com/([^/?#]+)/(following|lists?/?.*)", following_url, re.IGNORECASE)
     owner_handle = owner_match.group(1).lower() if owner_match else ""
     html_text = html.replace("&quot;", '"')
 
@@ -329,45 +329,93 @@ def extract_profile_candidates(following_url: str, html: str) -> list[dict[str, 
         value = handle.strip().lower()
         if not value or value in blocked or value == owner_handle:
             return False
-        return re.fullmatch(r"[a-zA-Z0-9_]{1,15}", handle) is not None
+        return re.fullmatch(r"[A-Za-z0-9_]{1,15}", handle) is not None
 
     soup = BeautifulSoup(html_text, "html.parser")
-    timeline = None
+    search_roots: list[Tag] = []
     for node in soup.find_all(attrs={"aria-label": True}):
-        aria = str(node.get("aria-label", ""))
-        if ("Cronología" in aria or "Timeline" in aria) and (
-            "Siguiendo" in aria or "Following" in aria
-        ):
-            timeline = node
-            break
-    if timeline is None:
-        return []
+        aria = clean_text(str(node.get("aria-label", ""))).lower()
+        if any(term in aria for term in ("following", "siguiendo", "members", "miembros", "lista", "list")):
+            if isinstance(node, Tag):
+                search_roots.append(node)
+    if not search_roots:
+        search_roots = [soup]
 
     candidates: list[dict[str, str]] = []
     seen: set[str] = set()
 
-    for cell in timeline.find_all(attrs={"data-testid": "UserCell"}):
-        handle: str | None = None
-        for anchor in cell.find_all("a", href=True):
-            href = str(anchor["href"]).strip()
-            match = re.fullmatch(r"/([A-Za-z0-9_]{1,15})", href)
-            if not match:
+    def add_handle(raw_handle: str) -> None:
+        handle = str(raw_handle).strip().lstrip("/")
+        if not is_valid_handle(handle):
+            return
+        lower = handle.lower()
+        if lower in seen:
+            return
+        seen.add(lower)
+        candidates.append({"url": f"https://x.com/{handle}"})
+
+    for root in search_roots:
+        cells = list(root.find_all(attrs={"data-testid": "UserCell"}))
+        if not cells and root is soup:
+            cells = list(soup.find_all(attrs={"data-testid": "UserCell"}))
+        for cell in cells:
+            for anchor in cell.find_all("a", href=True):
+                href = str(anchor["href"]).strip()
+                match = re.fullmatch(r"/([A-Za-z0-9_]{1,15})", href)
+                if match:
+                    add_handle(match.group(1))
+    return candidates
+
+
+def normalize_profile_handle(profile_url: str) -> str:
+    value = profile_url.rstrip("/").rsplit("/", 1)[-1].strip()
+    return value.lstrip("@")
+
+
+def compare_profile_sources(sources: dict[str, list[str]]) -> dict[str, object]:
+    normalized_sources: dict[str, list[str]] = {}
+    handle_sources: dict[str, set[str]] = {}
+
+    for source_name, urls in sources.items():
+        handles: list[str] = []
+        seen: set[str] = set()
+        for url in urls:
+            handle = normalize_profile_handle(str(url))
+            if not handle:
                 continue
-            handle = match.group(1)
             lower = handle.lower()
-            if not is_valid_handle(handle) or lower in seen:
+            if lower in seen:
                 continue
             seen.add(lower)
-            break
-        if handle is None:
-            continue
+            handles.append(handle)
+            handle_sources.setdefault(lower, set()).add(source_name)
+        normalized_sources[source_name] = handles
 
-        candidates.append(
+    duplicates: list[dict[str, object]] = []
+    for handle_lower, source_names in sorted(handle_sources.items()):
+        if len(source_names) < 2:
+            continue
+        duplicates.append(
             {
-                "url": f"https://x.com/{handle}",
+                "handle": handle_lower,
+                "sources": sorted(source_names),
             }
         )
-    return candidates
+
+    unique_by_source: dict[str, list[str]] = {}
+    for source_name, handles in normalized_sources.items():
+        unique_by_source[source_name] = [
+            handle
+            for handle in handles
+            if len(handle_sources.get(handle.lower(), set())) == 1
+        ]
+
+    return {
+        "sources": normalized_sources,
+        "duplicates": duplicates,
+        "unique_by_source": unique_by_source,
+        "total_duplicates": len(duplicates),
+    }
 
 
 def normalize_urls(value: object) -> list[str]:
@@ -1108,6 +1156,31 @@ def get_success_profile_urls(db_config: dict[str, object], urls: list[str]) -> s
     cursor.close()
     conn.close()
     return {str(row[0]) for row in rows if row and row[0]}
+
+
+def get_saved_profile_urls(db_config: dict[str, object], limit: int | None = None) -> list[str]:
+    ensure_scan_db(db_config)
+    conn = _mysql_connection(db_config, with_database=True)
+    cursor = conn.cursor()
+    table_sql = _mysql_identifier(MYSQL_PROFILE_TABLE)
+    query = f"SELECT profile_url FROM {table_sql} ORDER BY generated_at DESC, id DESC"
+    params: tuple[object, ...] = ()
+    if limit is not None:
+        query += " LIMIT %s"
+        params = (max(1, int(limit)),)
+    cursor.execute(query, params)
+    urls: list[str] = []
+    seen: set[str] = set()
+    for row in cursor.fetchall():
+        url = str(row[0] or "").strip()
+        lower = url.lower()
+        if not url or lower in seen:
+            continue
+        seen.add(lower)
+        urls.append(url)
+    cursor.close()
+    conn.close()
+    return urls
 
 
 def get_scan_dashboard_data(db_config: dict[str, object], limit: int = 80) -> dict[str, object]:

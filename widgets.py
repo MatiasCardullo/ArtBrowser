@@ -5,8 +5,8 @@ from PyQt6.QtCore import QUrl
 from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
-    QCheckBox, QFormLayout, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QSizePolicy, QSplitter, QTextEdit, QVBoxLayout, QWidget
+    QCheckBox, QComboBox, QFormLayout, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+    QPushButton, QSizePolicy, QSplitter, QTextEdit, QVBoxLayout, QWidget
 )
 
 from config import DEFAULT_FOLLOWING_SCAN_URL, POPUP_URL
@@ -17,10 +17,14 @@ class SettingsTab(QWidget):
         initial_settings: dict[str, str | bool | int | float],
         on_scan: Callable[[dict[str, str | bool | int | float]], None],
         on_save: Callable[[dict[str, str | bool | int | float]], None],
+        on_compare: Callable[[dict[str, str | bool | int | float]], None],
+        on_compare_sql: Callable[[dict[str, str | bool | int | float]], None],
     ) -> None:
         super().__init__()
         self._on_scan = on_scan
         self._on_save = on_save
+        self._on_compare = on_compare
+        self._on_compare_sql = on_compare_sql
         self._build_ui(initial_settings)
 
     def _build_ui(self, initial_settings: dict[str, str | bool | int | float]) -> None:
@@ -42,6 +46,19 @@ class SettingsTab(QWidget):
         self.following_url_input = QLineEdit()
         self.following_url_input.setText(initial_url or DEFAULT_FOLLOWING_SCAN_URL)
         self.following_url_input.setPlaceholderText(DEFAULT_FOLLOWING_SCAN_URL)
+        self.target_kind_input = QComboBox()
+        self.target_kind_input.addItems(["Followings", "Lista"])
+        self.target_kind_input.setCurrentIndex(
+            1 if str(initial_settings.get("scan_target_kind", "followings")).strip().lower() == "list" else 0
+        )
+        form.addRow("Tipo de URL:", self.target_kind_input)
+
+        self.shallow_scan_checkbox = QCheckBox("Escaneo superficial (solo perfiles)")
+        self.shallow_scan_checkbox.setChecked(
+            bool(initial_settings.get("scan_shallow_mode", True))
+        )
+        form.addRow("Modo:", self.shallow_scan_checkbox)
+
         self.scan_button = QPushButton("Escanear")
         self.scan_button.clicked.connect(self._start_scan)
         url_row = QWidget()
@@ -50,7 +67,25 @@ class SettingsTab(QWidget):
         url_row_layout.addWidget(self.following_url_input)
         url_row_layout.addWidget(self.scan_button)
         url_row.setLayout(url_row_layout)
-        form.addRow("URL para escanear followings:", url_row)
+        form.addRow("URL principal:", url_row)
+
+        self.compare_urls_input = QTextEdit()
+        self.compare_urls_input.setPlaceholderText(
+            "Una URL de lista por linea\nhttps://x.com/i/lists/...\nhttps://x.com/i/lists/..."
+        )
+        self.compare_urls_input.setFixedHeight(110)
+        compare_value = str(initial_settings.get("scan_compare_urls", "")).strip()
+        if compare_value:
+            self.compare_urls_input.setPlainText(compare_value)
+        form.addRow("URLs para comparar:", self.compare_urls_input)
+
+        self.compare_button = QPushButton("Comparar listas")
+        self.compare_button.clicked.connect(self._start_compare)
+        form.addRow("", self.compare_button)
+
+        self.compare_sql_button = QPushButton("Comparar con SQL")
+        self.compare_sql_button.clicked.connect(self._start_compare_sql)
+        form.addRow("", self.compare_sql_button)
 
         self.max_scroll_rounds_input = QLineEdit()
         self.max_scroll_rounds_input.setText(
@@ -76,27 +111,6 @@ class SettingsTab(QWidget):
         )
         form.addRow("Reusar resultados:", self.skip_already_ok_checkbox)
 
-        self.mysql_host_input = QLineEdit()
-        self.mysql_host_input.setText(str(initial_settings.get("mysql_host", "127.0.0.1")))
-        form.addRow("MySQL host:", self.mysql_host_input)
-
-        self.mysql_port_input = QLineEdit()
-        self.mysql_port_input.setText(str(as_int(initial_settings.get("mysql_port", 3306), 3306)))
-        form.addRow("MySQL port:", self.mysql_port_input)
-
-        self.mysql_database_input = QLineEdit()
-        self.mysql_database_input.setText(str(initial_settings.get("mysql_database", "artbrowser")))
-        form.addRow("MySQL database:", self.mysql_database_input)
-
-        self.mysql_user_input = QLineEdit()
-        self.mysql_user_input.setText(str(initial_settings.get("mysql_user", "root")))
-        form.addRow("MySQL user:", self.mysql_user_input)
-
-        self.mysql_password_input = QLineEdit()
-        self.mysql_password_input.setText(str(initial_settings.get("mysql_password", "")))
-        self.mysql_password_input.setEchoMode(QLineEdit.EchoMode.Password)
-        form.addRow("MySQL password:", self.mysql_password_input)
-
         layout.addLayout(form)
 
         save_button = QPushButton("Guardar configuracion")
@@ -120,9 +134,25 @@ class SettingsTab(QWidget):
             return
         self._on_scan(settings_values)
 
+    def _start_compare(self) -> None:
+        settings_values = self._collect_settings_values()
+        if settings_values is None:
+            return
+        self._on_compare(settings_values)
+
+    def _start_compare_sql(self) -> None:
+        settings_values = self._collect_settings_values()
+        if settings_values is None:
+            return
+        self._on_compare_sql(settings_values)
+
     def set_scan_running(self, running: bool) -> None:
         self.scan_button.setEnabled(not running)
+        self.compare_button.setEnabled(not running)
+        self.compare_sql_button.setEnabled(not running)
         self.scan_button.setText("Escaneando..." if running else "Escanear")
+        self.compare_button.setText("Comparando..." if running else "Comparar listas")
+        self.compare_sql_button.setText("Comparando..." if running else "Comparar con SQL")
 
     def _collect_settings_values(self) -> dict[str, str | bool | int | float] | None:
         url = self.following_url_input.text().strip()
@@ -130,7 +160,6 @@ class SettingsTab(QWidget):
             max_scroll_rounds = int(self.max_scroll_rounds_input.text().strip())
             max_profiles = int(self.max_profiles_input.text().strip())
             parallel_workers = int(self.parallel_workers_input.text().strip())
-            mysql_port = int(self.mysql_port_input.text().strip())
         except ValueError:
             self.status_label.setText("Valores invalidos: revisa los numeros")
             return None
@@ -141,20 +170,16 @@ class SettingsTab(QWidget):
         if parallel_workers not in {2, 4}:
             self.status_label.setText("Workers paralelos debe ser 2 o 4")
             return None
-        if mysql_port <= 0:
-            self.status_label.setText("MySQL port debe ser > 0")
-            return None
+        compare_urls = self.compare_urls_input.toPlainText().strip()
         return {
             "following_scan_url": url or DEFAULT_FOLLOWING_SCAN_URL,
+            "scan_target_kind": "list" if self.target_kind_input.currentIndex() == 1 else "followings",
+            "scan_shallow_mode": self.shallow_scan_checkbox.isChecked(),
             "scan_following_max_scroll_rounds": max_scroll_rounds,
             "scan_following_max_profiles": max_profiles,
             "scan_parallel_requests": parallel_workers,
             "scan_skip_already_ok": self.skip_already_ok_checkbox.isChecked(),
-            "mysql_host": self.mysql_host_input.text().strip() or "127.0.0.1",
-            "mysql_port": mysql_port,
-            "mysql_database": self.mysql_database_input.text().strip() or "artbrowser",
-            "mysql_user": self.mysql_user_input.text().strip() or "root",
-            "mysql_password": self.mysql_password_input.text(),
+            "scan_compare_urls": compare_urls,
         }
 
 
@@ -223,6 +248,9 @@ class ScanTab(QWidget):
             view.setUrl(QUrl("about:blank"))
 
     def set_active_workers(self, count: int) -> None:
-        active = 4 if count >= 4 else 2
+        if count <= 0:
+            active = 0
+        else:
+            active = 4 if count >= 4 else 2
         for idx, view in enumerate(self.worker_views):
             view.setVisible(idx < active)

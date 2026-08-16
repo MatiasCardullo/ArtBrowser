@@ -116,6 +116,9 @@ def save_session(windows: Iterable[HasTabUrls] | None) -> None:
 def default_settings() -> dict[str, str | bool | int | float]:
     return {
         "following_scan_url": DEFAULT_FOLLOWING_SCAN_URL,
+        "scan_target_kind": "followings",
+        "scan_shallow_mode": True,
+        "scan_compare_urls": "",
         "scan_parallel_requests": SCAN_MAX_PARALLEL_REQUESTS,
         "scan_following_max_scroll_rounds": SCAN_FOLLOWING_MAX_SCROLL_ROUNDS,
         "scan_following_max_profiles": SCAN_FOLLOWING_MAX_PROFILES,

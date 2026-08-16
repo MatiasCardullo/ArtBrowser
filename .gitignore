@@ -8,3 +8,4 @@ test_*.py
 .env
 artbrowser_crash.log
 scan_debug.log
+*.pyc
