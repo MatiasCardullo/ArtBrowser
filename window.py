@@ -15,6 +15,8 @@ from PyQt6.QtWidgets import (
     QLineEdit, QMainWindow, QTabWidget, QToolBar, QVBoxLayout, QWidget
 )
 
+from web_common.navbar import BasicNavbar, address_to_url, save_web_page
+
 from config import (
     BASE_DIR, DEFAULT_URL, SCAN_DB_TABLE, SCAN_LOG_FILE,
     SCAN_FOLLOWING_MAX_PROFILES,
@@ -130,40 +132,28 @@ class BrowserWindow(QMainWindow):
         return WebEngineView(self.add_tab, BrowserWindow.profile)
 
     def _create_toolbar(self) -> None:
-        toolbar = QToolBar("Barra de navegación")
-        toolbar.setMovable(False)
-        self.addToolBar(toolbar)
-
-        back_action = QAction("←", self)
-        back_action.setToolTip("Atrás")
-        back_action.triggered.connect(self._go_back)
-        toolbar.addAction(back_action)
-
-        forward_action = QAction("→", self)
-        forward_action.setToolTip("Adelante")
-        forward_action.triggered.connect(self._go_forward)
-        toolbar.addAction(forward_action)
-
-        reload_action = QAction("⟳", self)
-        reload_action.setToolTip("Recargar")
-        reload_action.triggered.connect(self._reload_current)
-        toolbar.addAction(reload_action)
-
-        toolbar.addSeparator()
-        self.url_bar = QLineEdit()
-        self.url_bar.setPlaceholderText("https://www.example.com")
-        self.url_bar.returnPressed.connect(self._load_url_from_bar)
-        toolbar.addWidget(self.url_bar)
-
-        save_page_action = QAction("💾", self)
-        save_page_action.setToolTip("Guardar página")
-        save_page_action.triggered.connect(self._save_current_page)
-        toolbar.addAction(save_page_action)
-
-        settings_action = QAction("⚙", self)
+        navbar = BasicNavbar(self)
+        navbar.on_back = self._go_back
+        navbar.on_forward = self._go_forward
+        navbar.on_reload = self._reload_current
+        navbar.on_stop = lambda: self.current_view() and self.current_view().stop()
+        navbar.on_address_bar_enter = self._load_url_from_bar_handler
+        navbar.on_save_page = lambda: save_web_page(
+            self.current_view(),
+            target_dir=BASE_DIR / "saved_pages",
+            status_callback=self.statusBar().showMessage,
+        )
+        
+        # Guardar referencias para actualizar URL
+        self.url_bar = navbar.address_bar
+        
+        # Agregar botón Settings
+        settings_action = QAction("⚙", navbar)
         settings_action.setToolTip("Configuración")
         settings_action.triggered.connect(self.open_settings_tab)
-        toolbar.addAction(settings_action)
+        navbar.addAction(settings_action)
+        
+        self.addToolBar(navbar)
 
     def _create_tabs(self) -> None:
         self.tabs = QTabWidget()
@@ -213,10 +203,15 @@ class BrowserWindow(QMainWindow):
             return
         self.tabs.removeTab(index)
 
+    def _load_url_from_bar_handler(self, text: str):
+        """Wrapper para que BasicNavbar pueda acceder a _load_url_from_bar."""
+        self.url_bar.setText(text)
+        self._load_url_from_bar()
+
     def _load_url_from_bar(self) -> None:
-        url = QUrl(self.url_bar.text())
-        if not url.scheme():
-            url.setScheme("https")
+        url = address_to_url(self.url_bar.text())
+        if url is None:
+            return
         view = self.current_view()
         if view:
             view.setUrl(url)
@@ -2428,24 +2423,6 @@ class BrowserWindow(QMainWindow):
         if not value:
             return True
         return value in self.RELATED_PROFILE_BLOCKLIST
-
-    def _save_current_page(self) -> None:
-        view = self.current_view()
-        if view is None:
-            self.statusBar().showMessage("No hay una pagina web activa para guardar", 4000)
-            return
-        target_dir = BASE_DIR / "saved_pages"
-        target_dir.mkdir(parents=True, exist_ok=True)
-        host = view.url().host() or "page"
-        safe_host = re.sub(r"[^a-zA-Z0-9_-]+", "_", host).strip("_") or "page"
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        target_file = target_dir / f"{safe_host}_{timestamp}.html"
-
-        def _write_html(html: str) -> None:
-            target_file.write_text(html, encoding="utf-8")
-            self.statusBar().showMessage(f"Pagina guardada en {target_file.name}", 5000)
-
-        view.page().toHtml(_write_html)
 
     def closeEvent(self, event):
         self.scan_running = False
