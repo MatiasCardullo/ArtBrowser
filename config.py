@@ -8,6 +8,7 @@ from typing import Iterable, Protocol
 
 from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEngineSettings
 from PyQt6.QtWidgets import QApplication
+from web_common.session import collect_tabs
 
 BASE_DIR = Path(__file__).resolve().parent
 SESSION_FILE = BASE_DIR / "session.json"
@@ -56,6 +57,9 @@ class HasTabUrls(Protocol):
     def tab_urls(self) -> list[str]:
         ...
 
+    def tab_session_entries(self) -> list[dict[str, str]]:
+        ...
+
 
 def ensure_profile_storage() -> None:
     if OLD_PROFILE_DIR.exists() and not PROFILE_DIR.exists():
@@ -76,6 +80,7 @@ def configure_profile(app: QApplication) -> QWebEngineProfile:
     settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
     settings.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
     settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows, True)
+    settings.setAttribute(QWebEngineSettings.WebAttribute.PdfViewerEnabled, True)
     settings.setAttribute(
         QWebEngineSettings.WebAttribute.JavascriptCanAccessClipboard, True
     )
@@ -84,31 +89,52 @@ def configure_profile(app: QApplication) -> QWebEngineProfile:
     return profile
 
 
-def load_session() -> list[list[str]]:
+def load_session() -> list[list[dict[str, str]]]:
     if not SESSION_FILE.exists():
-        return [[DEFAULT_URL]]
+        return [[{"url": DEFAULT_URL}]]
     try:
         raw = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
         windows = raw.get("windows")
         if isinstance(windows, list):
-            normalized: list[list[str]] = []
+            normalized: list[list[dict[str, str]]] = []
             for window in windows:
                 if isinstance(window, list):
-                    normalized.append(
-                        [str(url) for url in window if isinstance(url, str) and url]
-                    )
+                    entries = []
+                    for item in window:
+                        if isinstance(item, str) and item:
+                            entries.append({"url": item})
+                        elif isinstance(item, dict) and isinstance(item.get("url"), str):
+                            entries.append(
+                                {
+                                    key: value
+                                    for key, value in item.items()
+                                    if key in {"url", "title", "favicon"}
+                                    and isinstance(value, str)
+                                    and value
+                                }
+                            )
+                    if entries:
+                        normalized.append(entries)
             if normalized:
                 return normalized
     except (json.JSONDecodeError, OSError):
         pass
-    return [[DEFAULT_URL]]
+    return [[{"url": DEFAULT_URL}]]
 
 
 def save_session(windows: Iterable[HasTabUrls] | None) -> None:
     if windows is None:
         data = []
     else:
-        data = [window.tab_urls() for window in windows if window.tab_urls()]
+        data = []
+        for window in windows:
+            entries = (
+                window.tab_session_entries()
+                if hasattr(window, "tab_session_entries")
+                else [{"url": url} for url in window.tab_urls()]
+            )
+            if entries:
+                data.append(entries)
     with SESSION_FILE.open("w", encoding="utf-8") as handle:
         json.dump({"windows": data}, handle, indent=2)
 

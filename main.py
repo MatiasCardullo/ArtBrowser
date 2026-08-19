@@ -41,8 +41,8 @@ def main() -> None:
 
     session = load_session()
     windows: list[BrowserWindow] = []
-    for urls in session:
-        window = BrowserWindow(urls)
+    for entries in session:
+        window = BrowserWindow(entries)
         window.show()
         windows.append(window)
 

@@ -16,9 +16,11 @@ from PyQt6.QtWidgets import (
 )
 
 from web_common.navbar import BasicNavbar, address_to_url, save_web_page
+from web_common.pdf_tab import PdfTab
+from web_common.session import collect_tabs, is_navigation_title, restore_tab_metadata
 
 from config import (
-    BASE_DIR, DEFAULT_URL, SCAN_DB_TABLE, SCAN_LOG_FILE,
+    BASE_DIR, DEFAULT_URL, POPUP_URL, SCAN_DB_TABLE, SCAN_LOG_FILE,
     SCAN_FOLLOWING_MAX_PROFILES,
     SCAN_FOLLOWING_MAX_SCROLL_ROUNDS,
     SCAN_SKIP_ALREADY_OK,
@@ -74,7 +76,7 @@ class BrowserWindow(QMainWindow):
         "xsupport",
     }
 
-    def __init__(self, initial_urls: list[str] | None = None) -> None:
+    def __init__(self, initial_urls: list[str | dict[str, str]] | None = None) -> None:
         super().__init__()
         self.setWindowTitle("ArtBrowser")
         self.resize(1200, 800)
@@ -104,8 +106,14 @@ class BrowserWindow(QMainWindow):
         self._create_tabs()
 
         urls = initial_urls or [DEFAULT_URL]
-        for url in urls:
-            self.add_tab(url)
+        for entry in urls:
+            if isinstance(entry, dict):
+                url = entry.get("url", "")
+                view = self.add_tab(POPUP_URL)
+                restore_tab_metadata(self.tabs, self.tabs.indexOf(view), entry)
+                view.setUrl(QUrl(url))
+            else:
+                self.add_tab(entry)
 
     def _ensure_cookie_capture(self) -> None:
         if BrowserWindow.profile is None or BrowserWindow.cookie_capture_connected:
@@ -129,7 +137,25 @@ class BrowserWindow(QMainWindow):
         BrowserWindow.profile_cookies[name] = value
 
     def _create_web_view(self) -> WebEngineView:
-        return WebEngineView(self.add_tab, BrowserWindow.profile)
+        return WebEngineView(
+            self.add_tab,
+            BrowserWindow.profile,
+            new_tab_page_handler=lambda: self.add_tab(POPUP_URL),
+            pdf_handler=self._open_pdf_from_view,
+        )
+
+    def _open_pdf_from_view(self, _view: WebEngineView, path: str):
+        self.open_pdf_tab(path)
+
+    def open_pdf_tab(self, path: str):
+        tab = PdfTab(path, self)
+        title = Path(path).name
+        index = self.tabs.addTab(tab, title[:30] or "PDF")
+        self.tabs.setCurrentIndex(index)
+        return tab
+
+    def tab_session_entries(self) -> list[dict[str, str]]:
+        return collect_tabs(self.tabs, skip_widgets=(self.plus_widget,))
 
     def _create_toolbar(self) -> None:
         navbar = BasicNavbar(self)
@@ -232,13 +258,25 @@ class BrowserWindow(QMainWindow):
         view.setUrl(qurl)
         view.urlChanged.connect(self._update_url_bar)
         view.titleChanged.connect(
-            lambda title: self.tabs.setTabText(self.tabs.indexOf(view), title)
+            lambda title, tab=view: self._update_tab_title(tab, title)
         )
         insert_at = self.tabs.indexOf(self.plus_widget)
         index = self.tabs.insertTab(insert_at, view, "Nueva pestaña")
         self.tabs.setCurrentIndex(index)
         view.iconChanged.connect(lambda icon: self.tabs.setTabIcon(index, icon))
         return view
+
+    def _update_tab_title(self, view: WebEngineView, title: str) -> None:
+        index = self.tabs.indexOf(view)
+        if index < 0:
+            return
+        session_title = view.property("_session_title")
+        if is_navigation_title(title) and session_title:
+            self.tabs.setTabText(index, session_title)
+            return
+        if not is_navigation_title(title):
+            view.setProperty("_session_title", "")
+        self.tabs.setTabText(index, title or "Nueva pestaña")
 
     def tab_urls(self) -> list[str]:
         urls: list[str] = []
