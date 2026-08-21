@@ -51,6 +51,7 @@ from scanner import (
     save_scan_results,
 )
 from widgets import ScanTab, SettingsTab, WebEngineView
+from web_common import folder_viewer
 
 
 class BrowserWindow(QMainWindow):
@@ -142,6 +143,8 @@ class BrowserWindow(QMainWindow):
             BrowserWindow.profile,
             new_tab_page_handler=lambda: self.add_tab(POPUP_URL),
             pdf_handler=self._open_pdf_from_view,
+            folder_handler=folder_viewer.render_folder_view,
+            file_handler=folder_viewer.render_file_view,
         )
 
     def _open_pdf_from_view(self, _view: WebEngineView, path: str):

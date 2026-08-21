@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
 from config import DEFAULT_FOLLOWING_SCAN_URL, POPUP_URL
 from web_common.chromium_pdf import load_pdf_in_chromium
 from web_common.tabs import TabbedPopupWindow
+from web_common import folder_viewer
 
 class SettingsTab(QWidget):
     def __init__(
@@ -188,17 +189,29 @@ class SettingsTab(QWidget):
 
 
 class ArtBrowserWebPage(QWebEnginePage):
-    def __init__(self, profile, view, pdf_handler) -> None:
+    def __init__(self, profile, view, pdf_handler, folder_handler, file_handler) -> None:
         super().__init__(profile, view)
         self.view_widget = view
         self.pdf_handler = pdf_handler
+        self.folder_handler = folder_handler
+        self.file_handler = file_handler
 
     def acceptNavigationRequest(self, url, nav_type, is_main_frame):
+        if is_main_frame and url.scheme() == "browser-action":
+            return not folder_viewer.handle_action(self, url)
         if is_main_frame and url.scheme() == "file":
             local_path = url.toLocalFile()
             if os.path.splitext(local_path)[1].lower() == ".pdf":
                 handler = self.pdf_handler
                 QTimer.singleShot(0, lambda: handler(self.view_widget, local_path))
+                return False
+            if local_path and os.path.isdir(local_path):
+                handler = self.folder_handler
+                QTimer.singleShot(0, lambda: handler(self, local_path))
+                return False
+            if local_path and folder_viewer.is_text_file(local_path):
+                handler = self.file_handler
+                QTimer.singleShot(0, lambda: handler(self, local_path))
                 return False
         return super().acceptNavigationRequest(url, nav_type, is_main_frame)
 
@@ -210,14 +223,18 @@ class WebEngineView(QWebEngineView):
         profile: QWebEngineProfile | None = None,
         new_tab_page_handler: Callable[[], QWebEngineView] | None = None,
         pdf_handler=load_pdf_in_chromium,
+        folder_handler=folder_viewer.render_folder_view,
+        file_handler=folder_viewer.render_file_view,
     ) -> None:
         super().__init__()
         self._popup_tab_factory = popup_tab_factory
         self._new_tab_page_handler = new_tab_page_handler
         self._profile = profile
         self._pdf_handler = pdf_handler
+        self._folder_handler = folder_handler
+        self._file_handler = file_handler
         if profile is not None:
-            self.setPage(ArtBrowserWebPage(profile, self, pdf_handler))
+            self.setPage(ArtBrowserWebPage(profile, self, pdf_handler, folder_handler, file_handler))
 
     def createWindow(self, window_type):
         if (
@@ -235,6 +252,8 @@ class WebEngineView(QWebEngineView):
                 profile=self._profile,
                 new_tab_page_handler=new_tab_view_handler,
                 pdf_handler=self._pdf_handler,
+                folder_handler=self._folder_handler,
+                file_handler=self._file_handler,
             ),
         )
         popup_window.show()
